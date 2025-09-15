@@ -354,7 +354,7 @@ fn workflow(
         .par_iter()
         .map(|chunk| {
             // Acquire a permit before opening a BAM
-            let permit = semaphore.clone().blocking_acquire().unwrap();
+            let permit = semaphore.clone().acquire_owned().unwrap();
 
             // Call variants for this chunk
             let variants = call_variants(
