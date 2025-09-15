@@ -15,6 +15,10 @@ use std::fs::File;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 
 #[derive(Parser, Debug)]
@@ -132,7 +136,7 @@ impl BaseCall {
 
         match alignment.indel() {
             Indel::Del(len) => {
-                let start = ref_pos as usize;
+                let start = ref_pos as usize + 1;
                 let end = start + len as usize;
                 deleted_bases = ref_seq.get(start..end).unwrap_or(&[]).to_vec();
             }
@@ -450,6 +454,9 @@ fn workflow(
         .progress_chars("#>-"));
 
 
+    let max_open_files = 1000;
+    let open_files_counter = Arc::new(AtomicUsize::new(0));
+
 
     // Rayon thread pool
     let pool = rayon::ThreadPoolBuilder::new()
@@ -460,6 +467,12 @@ fn workflow(
     chunks
         .par_iter()
         .map(|chunk| {
+            while open_files_counter.load(Ordering::SeqCst) >= max_open_files {
+                thread::sleep(Duration::from_millis(1));
+            }
+
+            open_files_counter.fetch_add(1, Ordering::SeqCst);
+            
             let res = call_variants(
                 chunk,
                 bam_path,
@@ -475,6 +488,7 @@ fn workflow(
             .unwrap_or_else(|e| {
                 Vec::new()
             });
+            open_files_counter.fetch_sub(1, Ordering::SeqCst);
             pb.inc(1);
             res
         })
