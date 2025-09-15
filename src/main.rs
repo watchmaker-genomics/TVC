@@ -11,8 +11,8 @@ use std::io::Write;
 use rust_htslib::bam::pileup::Indel;
 use rayon::prelude::*;
 use std::fs::File;
+use semaphore_sync::Semaphore;
 use std::sync::Arc;
-use async_lock::Semaphore;
 
 #[derive(Parser, Debug)]
 #[command(name = "tvc", about = "A Taps Variant Caller")]
@@ -349,16 +349,15 @@ fn workflow(
         .build()?;
 
 
-// Create the semaphore before the pool
-let max_open_files = num_threads * 2; // adjust as needed
+let max_open_files = num_threads * 2;
 let semaphore = Arc::new(Semaphore::new(max_open_files));
 
 let all_variants: Vec<Variant> = pool.install(|| {
     chunks
         .par_iter()
         .map(|chunk| {
-            // Acquire a permit before opening a BAM (blocking)
-            let permit = semaphore.clone().lock(); // blocks if max_open_files reached
+            // Acquire a permit (blocking)
+            let permit = semaphore.access();
 
             // Call variants for this chunk
             let variants = call_variants(
@@ -375,15 +374,13 @@ let all_variants: Vec<Variant> = pool.install(|| {
             )
             .unwrap_or_else(|_| Vec::new());
 
-            // Drop the permit immediately to free a slot
-            drop(permit);
+            drop(permit); // release semaphore
 
             variants
         })
         .flatten()
         .collect()
 });
-
     println!("Found {} variants", all_variants.len());
 
 
