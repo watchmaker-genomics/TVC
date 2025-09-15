@@ -2,6 +2,7 @@ use clap::Parser;
 
 use rust_htslib::bam::{self, Read, FetchDefinition};
 use rust_htslib::bam::pileup::Pileup;
+use rust_htslib::bam::pileup::Alignment;
 use rust_htslib::faidx;
 use std::error::Error;
 use std::collections::HashMap;
@@ -245,10 +246,21 @@ fn get_nm_tag(record: &bam::Record) -> u32 {
     }
 }
 
+fn get_deletion_information(alignment: &Alignment) -> i32 {
+    match alignment.indel() {
+        Indel::None => 0,
+        Indel::Del(len) => {
+            println!("Deletion length: {}", len);
+            len as i32
+        }
+        Indel::Ins(_) => 0, // insertions are not deletions
+    }
+}
 
 fn extract_pileup_counts(pileup: &Pileup, min_bq: usize, min_mapq: usize, end_of_read_cutoff: usize, max_mismatches: u32) -> (HashMap<char, usize>, HashMap<char, usize>, HashMap<char, usize>) {
     let mut r_one_f_counts = HashMap::new();
     let mut r_one_r_counts = HashMap::new();
+
     let mut total_counts = HashMap::new();
     
 
@@ -294,8 +306,8 @@ fn extract_pileup_counts(pileup: &Pileup, min_bq: usize, min_mapq: usize, end_of
                 continue;
             }
 
-            
-
+            get_deletion_information(&alignment);
+           
             if record.is_reverse() && record.is_first_in_template() {
                 r_one_r_counts.insert(base, r_one_r_counts.get(&base).unwrap_or(&0) + 1);
             } else if !record.is_reverse() && record.is_first_in_template() {
