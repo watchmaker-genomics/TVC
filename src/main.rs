@@ -11,7 +11,8 @@ use std::io::Write;
 use rust_htslib::bam::pileup::Indel;
 use rayon::prelude::*;
 use std::fs::File;
-
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Parser, Debug)]
 #[command(name = "tvc", about = "A Taps Variant Caller")]
@@ -340,6 +341,8 @@ fn workflow(
     let chunks: Vec<GenomeChunk> = get_genome_chunks(ref_path, chunk_size);
 
 
+    let max_open_files = num_threads * 2 + 10;
+    let semaphore = Arc::new(Semaphore::new(max_open_files));
 
     // Rayon thread pool
     let pool = rayon::ThreadPoolBuilder::new()
@@ -350,7 +353,11 @@ fn workflow(
     chunks
         .par_iter()
         .map(|chunk| {
-            call_variants(
+            // Acquire a permit before opening a BAM
+            let permit = semaphore.clone().blocking_acquire().unwrap();
+
+            // Call variants for this chunk
+            let variants = call_variants(
                 chunk,
                 bam_path,
                 seq_name_to_seq.get(&chunk.contig)
@@ -362,9 +369,12 @@ fn workflow(
                 max_mismatches,
                 min_ao,
             )
-            .unwrap_or_else(|e| {
-                Vec::new()
-            })
+            .unwrap_or_else(|_| Vec::new());
+
+            // Drop the permit immediately to free a slot
+            drop(permit);
+
+            variants
         })
         .flatten()
         .collect()
