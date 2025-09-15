@@ -1,0 +1,13 @@
+[package]
+name = "taps_variant_caller"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+litemap = "=0.7.4"
+zerofrom = "=0.1.5"
+rust-htslib = "0.49"
+bio = "1.4"
+statrs = "0.16"
+rayon = "1.7"
