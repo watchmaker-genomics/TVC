@@ -404,15 +404,13 @@ fn get_nm_tag(record: &bam::Record) -> u32 {
     match record.aux(b"NM") {
         Ok(bam::record::Aux::I8(n)) => n as u32,
         Ok(bam::record::Aux::U8(n)) => n as u32,
+        Ok(bam::record::Aux::I16(n)) => n as u32,
         Ok(bam::record::Aux::U16(n)) => n as u32,
+        Ok(bam::record::Aux::I32(n)) => n as u32,
         Ok(bam::record::Aux::U32(n)) => n,
         _ => panic!("NM tag missing or invalid"),
     }
 }
-
-
-
-
 
 
 fn extract_pileup_counts(pileup: &Pileup, min_bq: usize, min_mapq: usize, end_of_read_cutoff: usize, indel_end_of_read_cutoff: usize, max_mismatches: u32, ref_seq: &Vec<u8>, ref_pos: u32) -> (HashMap<BaseCall, usize>, HashMap<BaseCall, usize>, HashMap<BaseCall, usize>) {
