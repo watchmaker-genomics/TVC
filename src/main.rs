@@ -117,7 +117,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO\t{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\tPASS\tVT={};CD={}\tGT:DP:AO\t{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -303,7 +303,43 @@ fn get_genome_chunks(
     chunks
 }
 
-
+fn validate_fai_and_bam(fasta_path: &str, bam_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    //ensure the FAI and Bam header have the same contigs and lengths
+    let fai_reader = faidx::Reader::from_path(fasta_path)?;
+    let bam_reader = bam::Reader::from_path(bam_path)?;
+    let fai_contigs: HashMap<String, u64> = fai_reader
+        .seq_names()?
+        .iter()
+        .map(|name| {
+            let len = fai_reader.fetch_seq_len(name);
+            (name.clone(), len)
+        })
+        .collect();
+    let bam_header = bam_reader.header();
+    for tid in 0..bam_header.target_count() {
+        let name = std::str::from_utf8(bam_header.tid2name(tid as u32))?.to_string();
+        let len = bam_header.target_len(tid as u32).unwrap() as u64;
+        match fai_contigs.get(&name) {
+            Some(&fai_len) => {
+                if fai_len != len {
+                    return Err(format!(
+                        "Length mismatch for contig {}: FAI length = {}, BAM length = {}",
+                        name, fai_len, len
+                    )
+                    .into());
+                }
+            }
+            None => {
+                return Err(format!(
+                    "Contig {} found in BAM header but not in FAI",
+                    name
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
 
 fn find_where_to_call_variants(ref_base: char, alt_candidates: &HashSet<BaseCall>, upstream_base: char, downstream_base: char) -> CallingDirective {
     
@@ -341,16 +377,17 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 
 
     format!(
-        "##fileformat=VCFv4.2\n\
-        {}
+        "##fileformat=VCFv4.3\n\
+        {}\n\
 ##INFO=<ID=VT,Number=1,Type=String,Description=\"Variant Type\">\n\
-        ##INFO=<ID=CD,Number=0,Type=String,Description=\"TVC Call Directive\">\n\
-        ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
-        ##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n\
-        ##FORMAT=<ID=RO,Number=1,Type=Integer,Description=\"Reference Allele Count\">\n\
-        ##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n\
-        #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
-    , contigs)
+##INFO=<ID=CD,Number=1,Type=String,Description=\"TVC Call Directive\">\n\
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n\
+##FORMAT=<ID=RO,Number=1,Type=Integer,Description=\"Reference Allele Count\">\n\
+##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
+        contigs
+    )
 }
 
 fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
@@ -502,6 +539,9 @@ fn workflow(
     chunk_size: u64,
     error_rate: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    validate_fai_and_bam(ref_path, bam_path)?;
+
     let ref_reader = faidx::Reader::from_path(ref_path)?;
     let contigs: Vec<String> = ref_reader.seq_names()?;
 
