@@ -55,6 +55,9 @@ struct Args {
 
     #[arg(short = 'c', long, default_value_t = 1000000)]
     chunk_size: u64,
+
+    #[arg(short = 'p', long, default_value_t = 0.005)]
+    error_rate: f64,
 }
 
 struct Variant {
@@ -63,6 +66,7 @@ struct Variant {
     reference: String,
     alt: String,
     genotype: String,
+    score: f64,
     depth: u32,
     alt_counts: u32,
 }
@@ -74,6 +78,7 @@ impl Variant {
         reference: String,
         alt: String,
         genotype: String,
+        score: f64,
         depth: u32,
         alt_counts: u32,
 
@@ -84,6 +89,7 @@ impl Variant {
             reference,
             alt,
             genotype,
+            score,
             depth,
             alt_counts,
         }
@@ -109,11 +115,12 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t100\t.\tVT={}\tGT:DP:AO\t{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={}\tGT:DP:AO\t{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
             self.alt,
+            self.score,
             variant_type,
             self.genotype,
             self.depth,
@@ -121,6 +128,31 @@ impl Variant {
         )
     }
 }
+
+
+
+struct Genotype{
+    genotype: String,
+    score: f64 
+}
+
+impl Genotype{
+    fn new(genotype: &str, probability: f64) -> Self {
+        let score = -10.0 * probability.log10();
+        Genotype { genotype: genotype.to_string(), score }
+    }
+}
+
+enum CALLING_DIRECTIVE {
+    REFERENCE_SITE_OB,
+    DENOVO_SITE_OB,
+    REFERENCE_SITE_OT,
+    DENOVO_SITE_OT,
+    BOTH_STRANDS,
+}
+
+
+
 
 #[derive(Clone)]
 struct BaseCall {
@@ -251,17 +283,25 @@ fn get_genome_chunks(
 
 
 
-fn find_where_to_call_variants(ref_base: char, alt_candidates: &HashSet<BaseCall>, upstream_base: char, downstream_base: char) -> String {
+fn find_where_to_call_variants(ref_base: char, alt_candidates: &HashSet<BaseCall>, upstream_base: char, downstream_base: char) -> CALLING_DIRECTIVE {
     
     let alt_candidate_bases: HashSet<char> = alt_candidates.iter().map(|bc| bc.base).collect();
     
-    if (ref_base == 'C'|| alt_candidate_bases.contains(&'C')) && downstream_base == 'G'{
-        return  "OB".to_string();
+    if ref_base == 'C' && downstream_base == 'G'{
+        return  CALLING_DIRECTIVE::REFERENCE_SITE_OB;
     }
-    else if (ref_base == 'G'|| alt_candidate_bases.contains(&'G')) && upstream_base == 'C'{
-        return  "OT".to_string();
+    else if alt_candidate_bases.contains(&'C') && downstream_base == 'G'{
+        return  CALLING_DIRECTIVE::DENOVO_SITE_OB;
     }
-    return "BOTH".to_string();
+    else if ref_base == 'G' && upstream_base == 'C'{
+        return  CALLING_DIRECTIVE::REFERENCE_SITE_OT;
+    }
+    else if alt_candidate_bases.contains(&'G') && upstream_base == 'C'{
+        return  CALLING_DIRECTIVE::DENOVO_SITE_OT;
+    }
+    else {
+        return CALLING_DIRECTIVE::BOTH_STRANDS;
+    }
 }
 
 fn get_vcf_header(header: &bam::HeaderView) -> String {
@@ -296,17 +336,16 @@ fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
     1.0 - cdf                          // P(X ≥ k)
 }
 
-fn get_count_vec_candidates(counts: &HashMap<BaseCall, usize>, ref_base: char) -> HashSet<BaseCall> {
+fn get_count_vec_candidates(counts: &HashMap<BaseCall, usize>, ref_base: char, error_rate: f64) -> HashSet<BaseCall> {
     let mut candidates = HashSet::new();
 
     let total_depth = counts.values().sum::<usize>() as u64;
-    let p = 0.005; // Placeholder for the probability of success
     for (basecall, &count) in counts.iter() {
 
         if (basecall.base == ref_base &&  basecall.is_snp())|| basecall.base == 'N' {
             continue;
         }
-        let pval = right_tail_binomial_pval(total_depth, count as u64, p);
+        let pval = right_tail_binomial_pval(total_depth, count as u64, error_rate);
         if pval < 0.05 {
             candidates.insert(basecall.clone());
         }
@@ -318,27 +357,27 @@ fn get_count_vec_candidates(counts: &HashMap<BaseCall, usize>, ref_base: char) -
 fn assign_genotype(
     alt_counts: usize,
     depth: usize,
-) -> &'static str {
-    let p = 0.005; // Placeholder for the probability of success
+    error_rate: f64,
+) -> Genotype {
 
-    let homo_ref_binom = Binomial::new(p, depth.try_into().unwrap()).expect("Failed to create binomial dist");
+    let homo_ref_binom = Binomial::new(error_rate, depth.try_into().unwrap()).expect("Failed to create binomial dist");
     let homo_ref_prob = homo_ref_binom.pmf(alt_counts.try_into().unwrap());
     
     let het_binom = Binomial::new(0.5, depth.try_into().unwrap()).expect("Failed to create binomial dist");
     let het_binom_prob = het_binom.pmf(alt_counts.try_into().unwrap());
     
-    let alt_prob = 1.0 - p as f64;
+    let alt_prob = 1.0 - error_rate;
     let homo_alt_binom = Binomial::new(alt_prob, depth.try_into().unwrap()).expect("Failed to create binomial dist");
     let homo_alt_prob = homo_alt_binom.pmf(alt_counts.try_into().unwrap());
 
     if homo_ref_prob > het_binom_prob && homo_ref_prob > homo_alt_prob {
-        return "0/0"
+        return Genotype::new("0/0", homo_ref_prob)
 
     } else if het_binom_prob > homo_ref_prob && het_binom_prob > homo_alt_prob {
-        return "0/1"
+        return Genotype::new("0/1", het_binom_prob)
 
     } else {
-        return "1/1"
+        return Genotype::new("1/1", homo_alt_prob)
 
     }
 
@@ -446,6 +485,7 @@ fn workflow(
     min_ao: u32,
     num_threads: usize,
     chunk_size: u64,
+    error_rate: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ref_reader = faidx::Reader::from_path(ref_path)?;
     let contigs: Vec<String> = ref_reader.seq_names()?;
@@ -498,6 +538,7 @@ fn workflow(
                 indel_end_of_read_cutoff,
                 max_mismatches,
                 min_ao,
+                error_rate
             )
             .unwrap_or_else(|e| {
                 Vec::new()
@@ -536,7 +577,7 @@ fn workflow(
 }
 
 
-fn call_variants(chunk: &GenomeChunk, bam_path: &str, ref_seq: &Vec<u8>,  min_bq: usize, min_mapq: usize, min_depth: u32, end_of_read_cutoff: usize, indel_end_of_read_cutoff: usize, max_mismatches: u32, min_ao: u32) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
+fn call_variants(chunk: &GenomeChunk, bam_path: &str, ref_seq: &Vec<u8>,  min_bq: usize, min_mapq: usize, min_depth: u32, end_of_read_cutoff: usize, indel_end_of_read_cutoff: usize, max_mismatches: u32, min_ao: u32, error_rate: f64) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
     // Placeholder for the workflow function
     // This is where the main logic of your variant caller would go
     
@@ -591,8 +632,8 @@ fn call_variants(chunk: &GenomeChunk, bam_path: &str, ref_seq: &Vec<u8>,  min_bq
 
 
 
-        let r_one_f_candidates = get_count_vec_candidates(&r_one_f_counts, ref_base as char);
-        let r_one_r_candidates = get_count_vec_candidates(&r_one_r_counts, ref_base as char);
+        let r_one_f_candidates = get_count_vec_candidates(&r_one_f_counts, ref_base as char, error_rate);
+        let r_one_r_candidates = get_count_vec_candidates(&r_one_r_counts, ref_base as char, error_rate);
         
         let (candidates, counts): (HashSet<BaseCall>, HashMap<BaseCall, usize>) =
     match find_where_to_call_variants(
@@ -600,23 +641,23 @@ fn call_variants(chunk: &GenomeChunk, bam_path: &str, ref_seq: &Vec<u8>,  min_bq
         &r_one_f_candidates,
         upstream_base as char,
         downstream_base as char,
-    ).as_str() {
-        "OB" => (
+    ) {
+        CALLING_DIRECTIVE::REFERENCE_SITE_OB | CALLING_DIRECTIVE::DENOVO_SITE_OB => (
+        
             r_one_r_candidates.clone(),
             r_one_r_counts.clone(),
         ),
-        "OT" => (
+        CALLING_DIRECTIVE::REFERENCE_SITE_OT | CALLING_DIRECTIVE::DENOVO_SITE_OT => (
             r_one_f_candidates.clone(),
             r_one_f_counts.clone(),
         ),
-        "BOTH" => (
+        CALLING_DIRECTIVE::BOTH_STRANDS => (
             r_one_f_candidates
                 .intersection(&r_one_r_candidates)
                 .cloned()
                 .collect(),
             total_counts.clone(),
-        ),
-        _ => panic!("Invalid variant calling strategy"),
+        )
     };
 
         let total_depth = counts.values().sum::<usize>() as u64;
@@ -632,8 +673,8 @@ fn call_variants(chunk: &GenomeChunk, bam_path: &str, ref_seq: &Vec<u8>,  min_bq
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, total_depth as usize);
-                if genotype == "0/0" {
+                let genotype = assign_genotype(*alt_counts, total_depth as usize, error_rate);
+                if genotype.genotype == "0/0" {
                     continue;
                 }
 
@@ -642,7 +683,8 @@ fn call_variants(chunk: &GenomeChunk, bam_path: &str, ref_seq: &Vec<u8>,  min_bq
                     pos + 1, // Convert to 1-based position
                     candidate.get_reference_allele(),
                     candidate.get_alternate_allele(),
-                    genotype.to_string(),
+                    genotype.genotype,
+                    genotype.score,
                     total_depth as u32,
                     *alt_counts as u32,
                 );
@@ -670,8 +712,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
     let min_ao = args.min_ao;
     let num_threads = args.num_threads;
     let chunk_size = args.chunk_size;
+    let error_rate = args.error_rate;
 
-    workflow(bam_path, ref_path, vcf_path, min_bq, min_mapq, min_depth, end_of_read_cutoff, indel_end_of_read_cutoff, max_mismatches, min_ao, num_threads, chunk_size)?;
+    workflow(bam_path, ref_path, vcf_path, min_bq, min_mapq, min_depth, end_of_read_cutoff, indel_end_of_read_cutoff, max_mismatches, min_ao, num_threads, chunk_size, error_rate)?;
     
     Ok(())
 }
