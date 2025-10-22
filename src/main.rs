@@ -147,8 +147,20 @@ struct Genotype{
 }
 
 impl Genotype{
-    fn new(genotype: &str, probability: f64) -> Self {
-        let score = -10.0 * probability.log10();
+    fn new(genotype: &str, best_prob: f64, all_probs_sum: f64) -> Self {
+        // normalized probability of the best genotype
+        let p_best = best_prob / all_probs_sum;
+
+        // Avoid log10(0) by capping the minimum probability
+        let epsilon = 1e-300;
+        let p_safe = 1.0 - p_best;
+        let p_safe = p_safe.max(epsilon);
+
+        // Phred-scale quality
+        let score = -10.0 * p_safe.log10();
+
+        // Cap phred at something reasonable for VCF
+        let score = score.min(999.0);
         Genotype { genotype: genotype.to_string(), score }
     }
 }
@@ -366,42 +378,28 @@ fn get_count_vec_candidates(counts: &HashMap<BaseCall, usize>, ref_base: char, e
     candidates
 }
 
-fn assign_genotype(
-    alt_counts: usize,
-    depth: usize,
-    error_rate: f64,
-) -> Genotype {
+fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype {
+    let homo_ref_prob = Binomial::new(error_rate, depth as u64)
+        .unwrap()
+        .pmf(alt_counts as u64);
+    let het_prob = Binomial::new(0.5, depth as u64).unwrap().pmf(alt_counts as u64);
+    let homo_alt_prob = Binomial::new(1.0 - error_rate, depth as u64)
+        .unwrap()
+        .pmf(alt_counts as u64);
 
-    let homo_ref_binom = Binomial::new(error_rate, depth.try_into().unwrap()).expect("Failed to create binomial dist");
-    let homo_ref_prob = homo_ref_binom.pmf(alt_counts.try_into().unwrap());
-    
-    let het_binom = Binomial::new(0.5, depth.try_into().unwrap()).expect("Failed to create binomial dist");
-    let het_binom_prob = het_binom.pmf(alt_counts.try_into().unwrap());
-    
-    let alt_prob = 1.0 - error_rate;
-    let homo_alt_binom = Binomial::new(alt_prob, depth.try_into().unwrap()).expect("Failed to create binomial dist");
-    let homo_alt_prob = homo_alt_binom.pmf(alt_counts.try_into().unwrap());
+    let total = homo_ref_prob + het_prob + homo_alt_prob;
 
-    let sum_probs = homo_ref_prob + het_binom_prob + homo_alt_prob;
-let norm_ref = homo_ref_prob / sum_probs;
-let norm_het = het_binom_prob / sum_probs;
-let norm_alt = homo_alt_prob / sum_probs;
+    let (gt, best_prob) = if homo_ref_prob > het_prob && homo_ref_prob > homo_alt_prob {
+        ("0/0", homo_ref_prob)
+    } else if het_prob > homo_ref_prob && het_prob > homo_alt_prob {
+        ("0/1", het_prob)
+    } else {
+        ("1/1", homo_alt_prob)
+    };
 
-// Pick best genotype and posterior error probability
-let (genotype, post_prob) = if norm_ref > norm_het && norm_ref > norm_alt {
-    ("0/0", 1.0 - norm_ref)
-} else if norm_het > norm_ref && norm_het > norm_alt {
-    ("0/1", 1.0 - norm_het)
-} else {
-    ("1/1", 1.0 - norm_alt)
-};
-
-// Convert to Phred-scaled confidence of *error*
-let phred_score = -10.0 * post_prob.log10();
-Genotype { genotype: genotype.to_string(), score: phred_score }
-
-
+    Genotype::new(gt, best_prob, total)
 }
+
 
 fn get_nm_tag(record: &bam::Record) -> u32 {
     match record.aux(b"NM") {
