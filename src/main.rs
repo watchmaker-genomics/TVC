@@ -739,3 +739,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
     
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_htslib::faidx;
+
+    macro_rules! make_variant_test {
+        ($fn_name:ident, $bam_file:expr, $pos:expr, $ref_base:expr, $alt_base:expr, $gt:expr) => {
+            #[test]
+            fn $fn_name() {
+                let test_ref = "test_assets/chr11.fasta";
+                let test_bam = concat!("test_assets/testing_bams/", $bam_file);
+
+                // Load reference
+                let ref_reader = faidx::Reader::from_path(test_ref).expect("Failed to open FASTA");
+                let contig = "chr11";
+                let seq_len = ref_reader.fetch_seq_len(contig);
+                let ref_seq: Vec<u8> = ref_reader.fetch_seq(contig, 0, seq_len as usize)
+                    .expect("Failed to fetch seq")
+                    .into_iter()
+                    .map(|b| b.to_ascii_uppercase())
+                    .collect();
+
+                let chunk = GenomeChunk::new(contig.to_string(), $pos, $pos + 1);
+
+                let variants = call_variants(
+                    &chunk,
+                    test_bam,
+                    &ref_seq,
+                    20,  // min_bq
+                    1,   // min_mapq
+                    1,   // min_depth
+                    5,   // end_of_read_cutoff
+                    20,  // indel_end_of_read_cutoff
+                    10,  // max_mismatches
+                    1,   // min_ao
+                    0.005 // error_rate
+                ).expect("call_variants failed");
+
+                let matching_variant = variants.iter().find(|v| v.pos == $pos)
+                    .expect("Expected variant not found");
+
+                assert_eq!(matching_variant.contig, contig, "Chromosome mismatch");
+                assert_eq!(matching_variant.reference, $ref_base, "REF mismatch");
+                assert_eq!(matching_variant.alt, $alt_base, "ALT mismatch");
+                assert_eq!(matching_variant.genotype, $gt, "GT mismatch");
+            }
+        };
+    }
+
+    // Now define tests
+    make_variant_test!(test_both_strands_chr11_8198900_A_C_homo, "both_strands_chr11_8198900_A_C_homo.bam", 8198900, "A", "C", "1/1");
+    make_variant_test!(test_both_strands_chr11_8198951_T_A_het, "both_strands_chr11_8198951_T_A_het.bam", 8198951, "T", "A", "0/1");
+    make_variant_test!(test_denovo_ob_chr11_134755809_T_C_homo, "denovo_ob_chr11_134755809_T_C_homo.bam", 134755809, "T", "C", "1/1");
+    make_variant_test!(test_denovo_ob_chr11_134911365_T_C_het, "denovo_ob_chr11_134911365_T_C_het.bam", 134911365, "T", "C", "0/1");
+    make_variant_test!(test_denovo_ot_chr11_134012307_C_A_het, "denovo_ot_chr11_134012307_C_A_het.bam", 134012307, "C", "A", "0/1");
+    make_variant_test!(test_denovo_ot_chr11_134479860_A_G_homo, "denovo_ot_chr11_134479860_A_G_homo.bam", 134479860, "A", "G", "1/1");
+    make_variant_test!(test_ref_ob_chr11_134012307_C_A_het, "ref_ob_chr11_134012307_C_A_het.bam", 134012307, "C", "A", "0/1");
+    make_variant_test!(test_ref_ob_chr11_134610622_C_T_homo, "ref_ob_chr11_134610622_C_T_homo.bam", 134610622, "C", "T", "1/1");
+    make_variant_test!(test_ref_ot_chr11_134473154_G_A_homo, "ref_ot_chr11_134473154_G_A_homo.bam", 134473154, "G", "A", "1/1");
+    make_variant_test!(test_ref_ot_chr11_8195526_G_A_het, "ref_ot_chr11_8195526_G_A_het.bam", 8195526, "G", "A", "0/1");
+    // skip methylation_site.bam unless you have a variant to check
+}
+
