@@ -344,8 +344,8 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 
 fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
     let binom = Binomial::new(p, n).expect("Failed to create binomial dist");
-    let cdf = binom.cdf((k - 1) as u64); // P(X < k)
-    1.0 - cdf                          // P(X ≥ k)
+    let cdf = binom.cdf((k - 1) as u64); 
+    1.0 - cdf
 }
 
 fn get_count_vec_candidates(counts: &HashMap<BaseCall, usize>, ref_base: char, error_rate: f64) -> HashSet<BaseCall> {
@@ -382,16 +382,24 @@ fn assign_genotype(
     let homo_alt_binom = Binomial::new(alt_prob, depth.try_into().unwrap()).expect("Failed to create binomial dist");
     let homo_alt_prob = homo_alt_binom.pmf(alt_counts.try_into().unwrap());
 
-    if homo_ref_prob > het_binom_prob && homo_ref_prob > homo_alt_prob {
-        return Genotype::new("0/0", homo_ref_prob)
+    let sum_probs = homo_ref_prob + het_binom_prob + homo_alt_prob;
+let norm_ref = homo_ref_prob / sum_probs;
+let norm_het = het_binom_prob / sum_probs;
+let norm_alt = homo_alt_prob / sum_probs;
 
-    } else if het_binom_prob > homo_ref_prob && het_binom_prob > homo_alt_prob {
-        return Genotype::new("0/1", het_binom_prob)
+// Pick best genotype and posterior error probability
+let (genotype, post_prob) = if norm_ref > norm_het && norm_ref > norm_alt {
+    ("0/0", 1.0 - norm_ref)
+} else if norm_het > norm_ref && norm_het > norm_alt {
+    ("0/1", 1.0 - norm_het)
+} else {
+    ("1/1", 1.0 - norm_alt)
+};
 
-    } else {
-        return Genotype::new("1/1", homo_alt_prob)
+// Convert to Phred-scaled confidence of *error*
+let phred_score = -10.0 * post_prob.log10();
+Genotype { genotype: genotype.to_string(), score: phred_score }
 
-    }
 
 }
 
