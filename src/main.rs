@@ -845,9 +845,7 @@ pub fn workflow(
 fn call_variants(chunk: &GenomeChunk, bam_path: &str, ref_seq: &Vec<u8>,  min_bq: usize, min_mapq: usize, min_depth: u32, end_of_read_cutoff: usize, indel_end_of_read_cutoff: usize, max_mismatches: u32, min_ao: u32, error_rate: f64) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
     // Placeholder for the workflow function
     // This is where the main logic of your variant caller would go
-    
-    println!("Processing chunk: {}:{}-{}", chunk.contig, chunk.start, chunk.end);
-    
+        
     let mut bam = bam::IndexedReader::from_path(bam_path).expect("Error opening BAM file");
     
     let header = bam.header().to_owned();
