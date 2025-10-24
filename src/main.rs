@@ -1,4 +1,5 @@
 use clap::Parser;
+use clap::ValueEnum;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -18,6 +19,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq, ValueEnum)]
+pub enum ReadNumber {
+    R1,
+    R2,
+}
 
 /// Input arguments for the Taps Variant Caller
 #[derive(Parser, Debug)]
@@ -56,6 +63,9 @@ struct Args {
 
     #[arg(short = 'p', long, default_value_t = 0.005)]
     error_rate: f64,
+
+    #[arg(short = 'r', long, value_enum, default_value_t = ReadNumber::R1)]
+    stranded_read: ReadNumber,
 }
 
 /// Representation of a genomic variant
@@ -70,6 +80,7 @@ struct Args {
 /// * `depth` - Read depth at the variant position
 /// * `alt_counts` - Count of reads supporting the alternate allele
 /// * `calling_directive` - Calling directive for the variant caller
+#[derive(Clone, Debug) ]
 struct Variant {
     contig: String,
     pos: u32,
@@ -182,6 +193,7 @@ struct Genotype {
     score: f64,
 }
 
+
 impl Genotype {
     /// Create a new Genotype instance with phred-scaled quality score
     ///
@@ -213,7 +225,7 @@ impl Genotype {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 /// Calling directives for the Taps Variant Caller
 ///# Variants
 /// * `ReferenceSiteOb` - Call at reference site on original bottom strand
@@ -616,6 +628,24 @@ fn get_nm_tag(record: &bam::Record) -> u32 {
     }
 }
 
+/// Determine if a record is the stranded read
+///
+/// # Arguments
+/// * `record` - The record to asses
+/// * `stranded_read` which read is stranded
+///
+/// # Returns
+/// True if the read is the stranded one
+fn is_stranded_read(record: &bam::Record, stranded_read: &ReadNumber) -> bool {
+    let read_orientation = match record.is_last_in_template() {
+        true => ReadNumber::R2,
+        false => ReadNumber::R1,
+    };
+
+    read_orientation == *stranded_read
+}
+
+
 /// Extract base call counts from a pileup
 ///
 /// # Arguments
@@ -639,6 +669,7 @@ fn extract_pileup_counts(
     max_mismatches: u32,
     ref_seq: &Vec<u8>,
     ref_pos: u32,
+    stranded_read: &ReadNumber,
 ) -> (
     HashMap<BaseCall, usize>,
     HashMap<BaseCall, usize>,
@@ -694,22 +725,22 @@ fn extract_pileup_counts(
                 }
             }
 
-            if record.is_reverse() && record.is_first_in_template() {
+            if record.is_reverse() && is_stranded_read(&record, stranded_read) {
                 r_one_r_counts.insert(
                     base_call.clone(),
                     r_one_r_counts.get(&base_call).unwrap_or(&0) + 1,
                 );
-            } else if !record.is_reverse() && record.is_first_in_template() {
+            } else if !record.is_reverse() && is_stranded_read(&record, stranded_read) {
                 r_one_f_counts.insert(
                     base_call.clone(),
                     r_one_f_counts.get(&base_call).unwrap_or(&0) + 1,
                 );
-            } else if record.is_reverse() && !record.is_first_in_template() {
+            } else if record.is_reverse() && !is_stranded_read(&record, stranded_read) {
                 r_one_f_counts.insert(
                     base_call.clone(),
                     r_one_f_counts.get(&base_call).unwrap_or(&0) + 1,
                 );
-            } else if !record.is_reverse() && !record.is_first_in_template() {
+            } else if !record.is_reverse() && !is_stranded_read(&record, stranded_read) {
                 r_one_r_counts.insert(
                     base_call.clone(),
                     r_one_r_counts.get(&base_call).unwrap_or(&0) + 1,
@@ -758,6 +789,7 @@ pub fn workflow(
     num_threads: usize,
     chunk_size: u64,
     error_rate: f64,
+    stranded_read: &ReadNumber,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_fai_and_bam(ref_path, bam_path)?;
 
@@ -819,6 +851,7 @@ pub fn workflow(
                     max_mismatches,
                     min_ao,
                     error_rate,
+                    stranded_read,
                 )
                 .unwrap_or_else(|_e| Vec::new());
                 open_files_counter.fetch_sub(1, Ordering::SeqCst);
@@ -879,6 +912,7 @@ fn call_variants(
     max_mismatches: u32,
     min_ao: u32,
     error_rate: f64,
+    stranded_read: &ReadNumber
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
     // Placeholder for the workflow function
     // This is where the main logic of your variant caller would go
@@ -917,6 +951,7 @@ fn call_variants(
             max_mismatches,
             ref_seq,
             pos,
+            stranded_read,
         );
 
         let mut all_found_alts: HashSet<&BaseCall> = HashSet::new();
@@ -1011,6 +1046,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_threads = args.num_threads;
     let chunk_size = args.chunk_size;
     let error_rate = args.error_rate;
+    let stranded_read = &args.stranded_read;
 
     workflow(
         bam_path,
@@ -1026,6 +1062,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_threads,
         chunk_size,
         error_rate,
+        stranded_read,
     )?;
 
     Ok(())
@@ -1047,10 +1084,11 @@ mod tests {
         // * `$ref_base` - Expected reference base
         // * `$alt_base` - Expected alternate base
         // * `$gt` - Expected genotype
+        // * `$stranded_read` - Which read is stranded
         //
         // # Returns
         // A test function
-        ($fn_name:ident, $bam_file:expr, $pos:expr, $ref_base:expr, $alt_base:expr, $gt:expr) => {
+        ($fn_name:ident, $bam_file:expr, $pos:expr, $ref_base:expr, $alt_base:expr, $gt:expr, $stranded_read:expr) => {
             #[test]
             fn $fn_name() {
                 let test_ref = "test_assets/chr11.fasta";
@@ -1078,6 +1116,7 @@ mod tests {
                     10,    // max_mismatches
                     1,     // min_ao
                     0.005, // error_rate
+                    &$stranded_read,
                 )
                 .expect("call_variants failed");
 
@@ -1101,7 +1140,8 @@ mod tests {
         8198900,
         "A",
         "C",
-        "1/1"
+        "1/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a call where methylation is not expected to interfer and is heterozygous
@@ -1111,7 +1151,8 @@ mod tests {
         8198951,
         "T",
         "A",
-        "0/1"
+        "0/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a call where there was a denovo CpG created and is homozygous alt where OB is expected to be non-methylated
@@ -1121,7 +1162,8 @@ mod tests {
         134755809,
         "T",
         "C",
-        "1/1"
+        "1/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a call where there was a denovo CpG created and is heterozygous where OB is expected to be non-methylated
@@ -1131,7 +1173,8 @@ mod tests {
         134911365,
         "T",
         "C",
-        "0/1"
+        "0/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a call where there was a denovo CpG created and is heterozygous where OT is expected to be non-methylated
@@ -1141,7 +1184,8 @@ mod tests {
         134749303,
         "A",
         "G",
-        "0/1"
+        "0/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a call where there was a denovo CpG created and is homozygous alt where OT is expected to be non-methylated
@@ -1151,7 +1195,8 @@ mod tests {
         134479860,
         "A",
         "G",
-        "1/1"
+        "1/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a reference CpG site where there is a heterozygous snp and OB expected to be the non-methylated strand
@@ -1161,7 +1206,8 @@ mod tests {
         134012307,
         "C",
         "A",
-        "0/1"
+        "0/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a reference CpG site where there is a homozygous alt snp and OB expected to be the non-methylated strand
@@ -1171,7 +1217,8 @@ mod tests {
         134610622,
         "C",
         "T",
-        "1/1"
+        "1/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a reference CpG site where there is a homozygous alt snp and OT expected to be the non-methylated strand
@@ -1181,7 +1228,8 @@ mod tests {
         134473154,
         "G",
         "A",
-        "1/1"
+        "1/1",
+        (ReadNumber::R1)
     );
 
     // This test tests a reference CpG site where there is a heterozygous snp and OT expected to be the non-methylated strand
@@ -1191,7 +1239,8 @@ mod tests {
         8195526,
         "G",
         "A",
-        "0/1"
+        "0/1",
+        (ReadNumber::R1)
     );
 
     #[test]
@@ -1223,6 +1272,7 @@ mod tests {
             10,    // max_mismatches
             1,     // min_ao
             0.005, // error_rate
+            &ReadNumber::R1 // stranded_read
         )
         .expect("call_variants failed");
 
@@ -1236,4 +1286,91 @@ mod tests {
             "Expected no variants in methylation site BAM"
         );
     }
+
+    #[test]
+    fn test_single_ended_reads() {
+        // Tests that single-ended reads are handled correctly
+        let test_ref = "test_assets/chr11.fasta";
+        let test_bam = "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.single_end.bam";
+        // Load reference
+        let ref_reader = faidx::Reader::from_path(test_ref).expect("Failed to
+    open FASTA");
+        let contig = "chr11";
+        let seq_len = ref_reader.fetch_seq_len(contig);
+        let ref_seq: Vec<u8> = ref_reader
+            .fetch_seq(contig, 0, seq_len as usize)
+            .expect("Failed to fetch seq")
+            .into_iter()
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+
+        // Define chunk covering the whole methylation region
+        let chunk = GenomeChunk::new(contig.to_string(), 134755601, 134755621);
+
+        let variants = call_variants(
+            &chunk, test_bam, &ref_seq, 20,    // min_bq
+            1,     // min_mapq
+            1,     // min_depth
+            5,     // end_of_read_cutoff
+            20,    // indel_end_of_read_cutoff
+            10,    // max_mismatches
+            1,     // min_ao
+            0.005, // error_rate
+            &ReadNumber::R1 // stranded_read
+        )
+        .expect("call_variants failed");
+
+        let filtered_variants: Vec<&Variant> = variants
+            .iter()
+            .filter(|v| v.pos >= 134755601 && v.pos <= 134755621)
+            .collect();
+
+        assert!(
+            filtered_variants.is_empty(),
+            "Expected no variants in single-ended methylation site BAM"
+        );
+    }
+
+    #[test]
+    fn test_read_two_stranded(){
+        // Tests that Read 2 stranded reads are handled correctly
+        let test_ref = "test_assets/chr11.fasta";
+        let test_bam = "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam";
+        // Load reference
+        let ref_reader = faidx::Reader::from_path(test_ref).expect("Failed to
+    open FASTA");
+        let contig = "chr11";
+        let seq_len = ref_reader.fetch_seq_len(contig);
+        let ref_seq: Vec<u8> = ref_reader
+            .fetch_seq(contig, 0, seq_len as usize)
+            .expect("Failed to fetch seq")
+            .into_iter()
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+
+        // Define chunk covering the whole methylation region
+        let chunk = GenomeChunk::new(contig.to_string(), 134755601, 134755621);
+        let variants = call_variants(
+            &chunk, test_bam, &ref_seq, 20,    // min_bq
+            1,     // min_mapq
+            1,     // min_depth
+            5,     // end_of_read_cutoff
+            20,    // indel_end_of_read_cutoff
+            10,    // max_mismatches
+            1,     // min_ao
+            0.005, // error_rate
+            &ReadNumber::R2 // stranded_read
+        )
+        .expect("call_variants failed");
+        let filtered_variants: Vec<&Variant> = variants
+            .iter()
+            .filter(|v| v.pos >= 134755601 && v.pos <= 134755621)
+            .collect();
+
+        assert!(
+            filtered_variants.len() == 2,
+            "Since the R2 was flipped the caller should call these instead got {}", filtered_variants.len()
+        );
+    }
+        
 }
