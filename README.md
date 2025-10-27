@@ -46,7 +46,7 @@ taps_variant_caller [OPTIONS] <INPUT_REF> <INPUT_BAM> <OUTPUT_VCF>
 | `-t, --num-threads <NUM_THREADS>` | Number of threads to use | `4` |
 | `-c, --chunk-size <CHUNK_SIZE>` | Number of reference bases processed per thread batch | `1,000,000` |
 | `-p, --error-rate <ERROR_RATE>` | Estimated per-base sequencing error rate used for binomial modeling | `0.005` |
-| `-r, --stranded_read <READ_NUMBER>` | The read that is in the same orientation of the molecule (R1/R2) 
+| `-r, --stranded_read <READ_NUMBER>` | The read that is in the same orientation of the molecule (R1/R2) | `R1`|
 | `-h, --help` | Print help message | — |
 
 ---
