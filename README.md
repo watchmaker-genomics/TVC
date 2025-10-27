@@ -17,8 +17,6 @@ The algorithm models general noise using a **binomial distribution**, then estim
 - TVC assumes diploid genotypes.  
 - TVC assumes that the orientation of either R1 or R2 is in the same orientation of the original molecule. This means adapters that do not preserve orientation such as AB adapters are not supported.
 - Reference and BAM files must be indexed (`.fai` and `.bai` respectively) and bams must contain NM tag entries.
-- Single-end data is not supported at this time
-
 
 ## Usage
 
