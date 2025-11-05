@@ -95,14 +95,14 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p release
-          cp target/${{ matrix.target }}/release/taps_variant_caller release/
-          tar -czf taps_variant_caller-${{ matrix.target }}.tar.gz -C release taps_variant_caller
+          cp target/${{ matrix.target }}/release/tvc/
+          tar -czf tvc-${{ matrix.target }}.tar.gz -C release tvc
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: taps_variant_caller-${{ matrix.target }}
-          path: taps_variant_caller-${{ matrix.target }}.tar.gz
+          name: tvc-${{ matrix.target }}
+          path: tvc-${{ matrix.target }}.tar.gz
 
 
   # ======================
@@ -115,7 +115,7 @@ jobs:
 
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
-      ECR_REPOSITORY: taps_variant_caller
+      ECR_REPOSITORY: tvc
 
     steps:
       - name: Checkout code
