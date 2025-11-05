@@ -1,0 +1,92 @@
+name: CI/CD Docker Build + Tests
+
+on:
+  push:
+    branches:
+      - ci_testing           # Run everything on this test branch
+    tags:
+      - 'v*.*.*'             # Run full build on version tags
+  pull_request:
+    branches:
+      - main                 # Run gated checks on PRs to main
+  workflow_dispatch:         # Allow manual runs
+
+jobs:
+  # ======================
+  # Run Rust Tests
+  # ======================
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run cargo fmt check
+        run: cargo fmt -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Run cargo unit tests
+        run: cargo test --all --locked --verbose
+
+  # ======================
+  # Build and Push Docker Image
+  # ======================
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+
+    # Only build/push when a tag or test branch triggers it
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/ci_testing'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Extract a tag (vX.Y.Z → X.Y.Z) or branch name for the Docker tag
+      - name: Extract version or branch name
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_ENV
+          fi
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/taps_variant_caller:latest
+            ${{ secrets.DOCKER_USERNAME }}/taps_variant_caller:${{ env.RELEASE_TAG }}
+
+

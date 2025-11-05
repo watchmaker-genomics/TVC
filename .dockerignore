@@ -1,0 +1,5 @@
+test_assets/
+*.log
+.DS_Store
+target/
+.vscode/
