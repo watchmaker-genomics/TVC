@@ -73,7 +73,7 @@ taps_variant_caller [OPTIONS] <INPUT_REF> <INPUT_BAM> <OUTPUT_VCF>
 ## Example
 
 ```
-taps_variant_caller \
+tvc \
     -t 8 \
     reference.fa \
     sample.bam \

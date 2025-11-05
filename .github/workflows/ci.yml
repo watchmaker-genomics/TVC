@@ -1,0 +1,186 @@
+name: CI/CD Docker + Binaries + Release
+
+on:
+  push:
+    branches:
+      - ci_testing           # Run full pipeline on this branch for testing
+    tags:
+      - 'v*.*.*'             # Run full release pipeline on version tags
+  pull_request:
+    branches:
+      - main                 # Run gated checks on PRs to main
+  workflow_dispatch:         # Allow manual runs
+
+jobs:
+  # ======================
+  # Run Rust Tests
+  # ======================
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+
+      - name: Install clippy
+        run: rustup component add clippy
+      - name: Pull Git LFS files
+        run: git lfs pull
+
+      - name: Run cargo fmt check
+        run: cargo fmt -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Run cargo unit tests
+        run: cargo test --all --locked --verbose
+
+
+  # ======================
+  # Build Multi-Arch Rust Binaries
+  # ======================
+  build-binaries:
+    needs: test
+    runs-on: ${{ matrix.os }}
+
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/ci_testing'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/tvc release/tvc
+          tar -czf tvc-${{ matrix.target }}.tar.gz -C release tvc
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tvc-${{ matrix.target }}
+          path: tvc-${{ matrix.target }}.tar.gz
+
+
+# ======================
+# Build and Push Multi-Arch Docker Image to Public ECR
+# ======================
+  build-and-push:
+    needs: [test]   # Only run after tests pass
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/ci_testing'
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      PUBLIC_REPO_ID: e5r9o8m6        # Replace with your public ECR ID
+      ECR_REPOSITORY: watchmakergenomics/tvc
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Extract version or branch name
+      - name: Extract version or branch name
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_ENV
+          fi
+
+      # Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Log in to Amazon ECR Public
+      - name: Log in to Amazon ECR Public
+        run: |
+          aws ecr-public get-login-password --region us-east-1 | \
+          docker login --username AWS --password-stdin public.ecr.aws/${{ env.PUBLIC_REPO_ID }}
+
+      # Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build and push multi-arch Docker image
+      - name: Build and Push Docker image to Public ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            public.ecr.aws/${{ env.PUBLIC_REPO_ID }}/${{ env.ECR_REPOSITORY }}:latest
+            public.ecr.aws/${{ env.PUBLIC_REPO_ID }}/${{ env.ECR_REPOSITORY }}:${{ env.RELEASE_TAG }}
+
+
+
+  # ======================
+  #  Create GitHub Release (only for tags)
+  # ======================
+  release:
+    needs: [build-binaries, build-and-push]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./artifacts/**/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
