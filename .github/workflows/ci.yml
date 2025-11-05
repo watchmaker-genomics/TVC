@@ -35,6 +35,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+
       - name: Run cargo fmt check
         run: cargo fmt -- --check
 
