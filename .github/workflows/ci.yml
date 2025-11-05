@@ -40,6 +40,8 @@ jobs:
 
       - name: Install clippy
         run: rustup component add clippy
+      - name: Pull Git LFS files
+        run: git lfs pull
 
       - name: Run cargo fmt check
         run: cargo fmt -- --check
