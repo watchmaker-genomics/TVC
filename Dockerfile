@@ -22,7 +22,7 @@ COPY . .
 RUN cargo build --release
 
 # Strip binary to reduce size
-RUN strip target/release/taps_variant_caller
+RUN strip target/release/tvc
 
 ################################################################################
 # RUNTIME STAGE
@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y \
     rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
-COPY --from=builder /usr/src/TVC/target/release/taps_variant_caller /usr/local/bin/taps_variant_caller
+COPY --from=builder /usr/src/TVC/target/release/tvc /usr/local/bin/tvc
 
 # Set entrypoint
-ENTRYPOINT ["/usr/local/bin/taps_variant_caller"]
+ENTRYPOINT ["/usr/local/bin/tvc"]
