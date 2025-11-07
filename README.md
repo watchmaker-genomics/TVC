@@ -1,14 +1,32 @@
-# Taps Variant Caller (TVC)
+# Taps+ Variant Caller (TVC)
 
-**TVC** is a germline variant caller purpose-built for **TAPS (TET-assisted pyridine borane sequencing)** data.  
+**TVC** is a germline variant caller purpose-built for **TAPS+ (TET-assisted pyridine borane sequencing)** data.  
 It is **CpG-aware**, **read-oriented**, and designed to factor out subtle methylation-induced patterns in order to avoid overcalling noise.
 
 ---
 
+## Installation
+
+You can obtain prebuilt binaries or container images from our official distribution channels:
+
+## Option 1: Download Binaries
+Precompiled binaries for macOS, Linux are available under the [**Releases**](https://github.com/watchmaker-genomics/TVC/releases) section of this repository.
+
+## Option 2: Pull from Amazon ECR Public
+
+The tool is also available as an amd64-only container image on Amazon ECR.
+
+### Pull the latest image
+docker pull public.ecr.aws/e5r9o8m6/watchmakergenomics/tvc:latest
+
+### Run directly
+docker run --rm public.ecr.aws/e5r9o8m6/watchmakergenomics/tvc:latest -h
+
+
 ## Overview
 
 TVC performs variant calling while accounting for **CpG context** — both in the reference genome and in the observed read data.  
-The algorithm models general noise using a **binomial distribution**, then estimates the most likely genotype (homozygous reference, heterozygous, or homozygous alternate) given observed allele counts and error rate parameters. This is inspired by the algorithm used in [Rastair](https://bitbucket.org/bsblabludwig/rastair/src/master/) .
+The algorithm models general noise using a **binomial distribution**, then estimates the most likely genotype (homozygous reference, heterozygous, or homozygous alternate) given observed allele counts and error rate parameters. This is inspired by the algorithm for determining genotypes in CpG that is used in [Rastair](https://bitbucket.org/bsblabludwig/rastair/src/master/) .
 
 ---
 
@@ -21,7 +39,7 @@ The algorithm models general noise using a **binomial distribution**, then estim
 ## Usage
 
 ```
-taps_variant_caller [OPTIONS] <INPUT_REF> <INPUT_BAM> <OUTPUT_VCF>
+tvc [OPTIONS] <INPUT_REF> <INPUT_BAM> <OUTPUT_VCF>
 ```
 
 ### Arguments
@@ -29,7 +47,7 @@ taps_variant_caller [OPTIONS] <INPUT_REF> <INPUT_BAM> <OUTPUT_VCF>
 | Argument | Description |
 |-----------|-------------|
 | `<INPUT_REF>` | Reference FASTA file |
-| `<INPUT_BAM>` | Aligned BAM file (paired-end) |
+| `<INPUT_BAM>` | Aligned and indexed BAM file |
 | `<OUTPUT_VCF>` | Output VCF path |
 
 ### Options
@@ -78,8 +96,13 @@ tvc \
     reference.fa \
     sample.bam \
     output.vcf
+```
 
 ## Development
+
+### Development requirements
+
+All pull requests to this repository are gated by the unit test passing, a format check with cargo fmt, and finally linting with cargo clippy.
 
 ### Git LFS Requirement
 
@@ -97,8 +120,6 @@ Before starting development, ensure Git LFS is installed on your system.
     ```bash
     sudo apt install git-lfs
     ```
-- **Windows:**
-    Download and run the installer from [https://git-lfs.com](https://git-lfs.com).
 
 #### Initialize Git LFS
 After installation, run:
@@ -109,8 +130,8 @@ git lfs install
 #### Pulling LFS Files
 When cloning the repository, make sure to fetch LFS files as well:
 ```bash
-git clone <repo_url>
-cd <repo_name>
+git clone git@github.com:watchmaker-genomics/TVC.git
+cd TVC
 git lfs pull
 ```
 
@@ -121,4 +142,3 @@ git lfs pull
 ```
 
 > **Note:** Development cannot proceed without Git LFS installed, as some large files required for the project are managed through LFS.
-

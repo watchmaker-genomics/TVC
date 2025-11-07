@@ -28,7 +28,7 @@ pub enum ReadNumber {
 
 /// Input arguments for the Taps Variant Caller
 #[derive(Parser, Debug)]
-#[command(name = "tvc", about = "A Taps Variant Caller")]
+#[command(name = "tvc", about = "A Taps+ Variant Caller")]
 struct Args {
     input_ref: String,
     input_bam: String,
