@@ -1,6 +1,8 @@
-# Taps+ Variant Caller (TVC)
+# TAPS+ Variant Caller (TVC)
 
 **TVC** is a germline variant caller purpose-built for **TAPS+ (TET-assisted pyridine borane sequencing)** data. It is **CpG-aware**, **read-oriented**, and designed to factor out subtle methylation-induced patterns in order to avoid overcalling noise.
+
+TVC performs variant calling while accounting for **CpG context** — both in the reference genome and in the observed read data. The algorithm models general noise using a **binomial distribution**, then estimates the most likely genotype (homozygous reference, heterozygous, or homozygous alternate) given observed allele counts and error rate parameters. This is inspired by the algorithm for determining genotypes in CpG that is used in [Rastair](https://bitbucket.org/bsblabludwig/rastair/src/master/) which was developed Benjamin Schuster-Böckler's lab at the University of Oxford, Ludwig Institute for Cancer Research.
 
 ---
 
@@ -15,6 +17,10 @@ Precompiled binaries for macOS, Linux are available under the [**Releases**](htt
 
 The tool is also available as an amd64-only container image on Amazon ECR.
 
+## Option 3: Build from Dockerfile
+
+You can build your own docker container by navigating to the top level directory with the docker file and running `docker build -t tvc ./`
+
 ### Pull the latest image
 docker pull public.ecr.aws/e5r9o8m6/watchmakergenomics/tvc:latest
 
@@ -24,17 +30,13 @@ docker run -it --rm public.ecr.aws/e5r9o8m6/watchmakergenomics/tvc:latest -h
 > Note: the `-it` allows for the progress bar to become visible when run. 
 
 
-## Overview
-
-TVC performs variant calling while accounting for **CpG context** — both in the reference genome and in the observed read data. The algorithm models general noise using a **binomial distribution**, then estimates the most likely genotype (homozygous reference, heterozygous, or homozygous alternate) given observed allele counts and error rate parameters. This is inspired by the algorithm for determining genotypes in CpG that is used in [Rastair](https://bitbucket.org/bsblabludwig/rastair/src/master/) which was developed Benjamin Schuster-Böckler's lab at the University of Oxford, Ludwig Institute for Cancer Research.
-
 ---
 
 ## Assumptions and Input Requirements
 
 - TVC assumes diploid genotypes.  
 - TVC assumes that the orientation of either R1 or R2 is in the same orientation of the original molecule. This means adapters that do not preserve orientation such as AB adapters are not supported.
-- Reference and BAM files must be indexed (`.fai` and `.bai` respectively) and bams must contain NM tag entries.
+- Reference and BAM files must be indexed (`.fai` and `.bai` respectively) and bams must contain NM tag entries, which come by default with aligners such as BWA-MEM and Bowtie2.
 
 ## Usage
 
@@ -72,7 +74,7 @@ tvc [OPTIONS] <INPUT_REF> <INPUT_BAM> <OUTPUT_VCF>
 ## Algorithm Summary
 
 1. **Context Awareness:**  
-   Each site is evaluated with respect to its **CpG context**, allowing the model to distinguish true C→T mutations from transitions due to TAPs modification or background noise.
+   Each site is evaluated with respect to its **CpG context**, allowing the model to distinguish true C→T mutations from transitions due to TAPS modification or background noise.
 
 2. **Noise Modeling:**  
    Observed alternate allele counts are tested against a **binomial distribution** parameterized by the estimated error rate default value of error is 0.005 and using an alpha of 0.05.  
@@ -98,7 +100,7 @@ tvc \
     output.vcf
 ```
 
-## Benchmarking TVC and other Taps+ materials 
+## Benchmarking TVC and other TAPS+ materials 
 
 Please see how we calculate F1 scores and it's current performance on a demo data set in [this notebook](analysis/TVC_benchmarking.ipynb).
 
