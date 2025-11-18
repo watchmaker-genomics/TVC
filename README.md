@@ -74,7 +74,7 @@ tvc [OPTIONS] <INPUT_REF> <INPUT_BAM> <OUTPUT_VCF>
 ## Algorithm Summary
 
 1. **Context Awareness:**  
-   Each site is evaluated with respect to its **CpG context**, allowing the model to distinguish true C→T mutations from transitions due to TAPS modification or background noise.
+   Each site is evaluated with respect to its **CpG context**, allowing the model to distinguish true C→T mutations from transitions due to TAPS+ modification or background noise.
 
 
 2. **Noise Modeling:**  
