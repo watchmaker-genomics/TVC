@@ -8,6 +8,7 @@ use rust_htslib::bam::pileup::Indel;
 use rust_htslib::bam::pileup::Pileup;
 use rust_htslib::bam::{self, Read};
 use rust_htslib::faidx;
+use rust_htslib::bam::record::Cigar;
 use statrs::distribution::{Binomial, Discrete, DiscreteCDF};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -46,7 +47,7 @@ struct Args {
     #[arg(short = 'e', long, default_value_t = 5)]
     end_of_read_cutoff: usize,
 
-    #[arg(short = 'i', long, default_value_t = 20)]
+    #[arg(short = 'i', long, default_value_t = 1)]
     indel_end_of_read_cutoff: usize,
 
     #[arg(short = 'x', long, default_value_t = 10)]
@@ -61,14 +62,11 @@ struct Args {
     #[arg(short = 'c', long, default_value_t = 1000000)]
     chunk_size: u64,
 
-    #[arg(short = 'p', long, default_value_t = 0.005)]
+    #[arg(short = 'p', long, default_value_t = 0.05)]
     error_rate: f64,
 
     #[arg(short = 'r', long, value_enum, default_value_t = ReadNumber::R1)]
     stranded_read: ReadNumber,
-
-    #[arg(short = 'H', long, default_value_t = 3)]
-    homopolymer_cutoff: usize,
 }
 
 /// Representation of a genomic variant
@@ -591,7 +589,7 @@ fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype
     let homo_ref_prob = Binomial::new(error_rate, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
-    let het_prob = Binomial::new(0.5, depth as u64)
+    let het_prob = Binomial::new(0.4, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
     let homo_alt_prob = Binomial::new(1.0 - error_rate, depth as u64)
@@ -697,6 +695,15 @@ fn dinuc_repeat_read_end(sequence: &[u8]) -> bool {
     sequence[start_index..end_index] == *last_two
 }
 
+fn check_soft_clip(record: &bam::Record) -> bool {
+    for op in record.cigar().iter() {
+        if let Cigar::SoftClip(_) = op {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract base call counts from a pileup
 /// # Arguments
 /// * `pileup` - The pileup to extract counts from
@@ -750,6 +757,10 @@ fn extract_pileup_counts(
             }
 
             if dinuc_repeat_read_start(&seq) || dinuc_repeat_read_end(&seq) {
+                continue;
+            }
+
+            if check_soft_clip(&record) {
                 continue;
             }
 
