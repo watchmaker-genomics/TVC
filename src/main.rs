@@ -644,7 +644,7 @@ fn is_stranded_read(record: &bam::Record, stranded_read: &ReadNumber) -> bool {
 
     read_orientation == *stranded_read
 }
-
+// check if there is a homopolymer at the start of the read
 fn homopolymer_read_start(sequence: &[u8], homopolymer_cutoff: usize) -> bool {
     let len = sequence.len();
     if len < homopolymer_cutoff {
@@ -658,8 +658,7 @@ fn homopolymer_read_start(sequence: &[u8], homopolymer_cutoff: usize) -> bool {
     }
     true
 }
-
-
+// check if there is a homopolymer at the end of the read
 fn homopolymer_read_end(sequence: &[u8], homopolymer_cutoff: usize) -> bool {
     if sequence.len() < homopolymer_cutoff {
         return false
@@ -672,7 +671,7 @@ fn homopolymer_read_end(sequence: &[u8], homopolymer_cutoff: usize) -> bool {
     }
     true
 }
-
+// check if there is a dinuc repeat at the start of the read
 fn dinuc_repeat_read_start(sequence: &[u8]) -> bool {
     if sequence.len() < 4 {
         return false;
@@ -682,7 +681,7 @@ fn dinuc_repeat_read_start(sequence: &[u8]) -> bool {
 
     sequence[2..4] == *first_two
 }
-
+// check if there is a dinuc repeat at the end of the read
 fn dinuc_repeat_read_end(sequence: &[u8]) -> bool {
     if sequence.len() < 4 {
         return false;
@@ -694,7 +693,7 @@ fn dinuc_repeat_read_end(sequence: &[u8]) -> bool {
 
     sequence[start_index..end_index] == *last_two
 }
-
+// Check if a record has soft clipping in its CIGAR string
 fn check_soft_clip(record: &bam::Record) -> bool {
     for op in record.cigar().iter() {
         if let Cigar::SoftClip(_) = op {
@@ -705,6 +704,7 @@ fn check_soft_clip(record: &bam::Record) -> bool {
 }
 
 /// Extract base call counts from a pileup
+///
 /// # Arguments
 /// * `pileup` - The pileup to extract counts from
 /// * `min_bq` - Minimum base quality
@@ -1539,8 +1539,8 @@ mod tests {
         ]);
         let qname = b"simulated_read";
         let seq = b"AAAAAAAAAA";
-        let qual = Qualities::from_bytes(vec![255; 10]);
-        let qual: Vec<u8> = qual.0;
+        let quals = Qualities::from_bytes(vec![255; 10]);
+        let qual: Vec<u8> = quals.0;
         record.set(qname, Some(&cigar_with_soft_clip), seq, &qual);
         assert!(check_soft_clip(&record));
 
