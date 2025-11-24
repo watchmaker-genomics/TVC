@@ -1520,5 +1520,35 @@ mod tests {
         assert!(!dinuc_repeat_read_start(seq));
         assert!(!dinuc_repeat_read_end(seq));
     }
+    
+    #[derive(Debug)]
+    struct Qualities(Vec<u8>);
+    impl Qualities {
+        fn from_bytes(bytes: Vec<u8>) -> Self {
+            Qualities(bytes)
+        }
+    }
 
+    #[test]
+    fn test_check_soft_clip() {
+        let mut record = bam::Record::new();
+        let cigar_with_soft_clip = bam::record::CigarString::from(vec![
+            Cigar::SoftClip(5),
+            Cigar::Match(10),
+            Cigar::SoftClip(3),
+        ]);
+        let qname = b"simulated_read";
+        let seq = b"AAAAAAAAAA";
+        let qual = Qualities::from_bytes(vec![255; 10]);
+        let qual: Vec<u8> = qual.0;
+        record.set(qname, Some(&cigar_with_soft_clip), seq, &qual);
+        assert!(check_soft_clip(&record));
+
+        let mut record_no_soft_clip = bam::Record::new();
+        let cigar_no_soft_clip = bam::record::CigarString::from(vec![
+            Cigar::Match(10),
+        ]);
+        record_no_soft_clip.set(qname, Some(&cigar_no_soft_clip), seq, &qual);
+        assert!(!check_soft_clip(&record_no_soft_clip));
+    }
 }
