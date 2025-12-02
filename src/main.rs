@@ -309,14 +309,14 @@ impl BaseCall {
     ///
     /// # Returns
     /// A string representing the reference allele
-    fn get_reference_allele(&self) -> String {
-        let mut ref_allele = String::new();
-        ref_allele.push(self.ref_base);
-        if !self.deleted_bases.is_empty() {
-            ref_allele.push_str(&String::from_utf8_lossy(&self.deleted_bases));
-        }
-        ref_allele
-    }
+    // fn get_reference_allele(&self) -> String {
+    //     let mut ref_allele = String::new();
+    //     ref_allele.push(self.ref_base);
+    //     if !self.deleted_bases.is_empty() {
+    //         ref_allele.push_str(&String::from_utf8_lossy(&self.deleted_bases));
+    //     }
+    //     ref_allele
+    // }
 
     /// Get the alternate allele string
     ///
@@ -338,6 +338,84 @@ impl BaseCall {
         !self.is_indel
     }
 }
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+enum VariantObservation {
+    Snp { base: char, ref_base: char, deleted_bases: Vec<u8>, insertion_bases: Vec<u8> },
+    Insertion { base: char, ref_base: char, deleted_bases: Vec<u8>, insertion_bases: Vec<u8> },
+    Deletion { base: char, ref_base: char, deleted_bases: Vec<u8>, insertion_bases: Vec<u8>  },
+}
+
+impl VariantObservation {
+    fn is_snp(&self) -> bool {
+        matches!(self, VariantObservation::Snp { .. })
+    }
+}
+
+impl From<&BaseCall> for VariantObservation {
+    fn from(bc: &BaseCall) -> Self {
+        if !bc.insertion_bases.is_empty() {
+            VariantObservation::Insertion {
+                base: bc.base,
+                ref_base: bc.ref_base,
+                deleted_bases: bc.deleted_bases.clone(),
+                insertion_bases: bc.insertion_bases.clone(),
+            }
+        } else if !bc.deleted_bases.is_empty() {
+            VariantObservation::Deletion {
+                base: bc.base,
+                ref_base: bc.ref_base,
+                deleted_bases: bc.deleted_bases.clone(),
+                insertion_bases: bc.insertion_bases.clone(),
+            }
+        } else {
+            VariantObservation::Snp {
+                base: bc.base,
+                ref_base: bc.ref_base,
+                deleted_bases: bc.deleted_bases.clone(),
+                insertion_bases: bc.insertion_bases.clone(),
+            }
+        }
+    }
+}
+impl VariantObservation {
+    pub fn get_reference_allele(&self) -> String {
+        let mut ref_allele = String::new();
+
+        match self {
+            VariantObservation::Snp { ref_base, deleted_bases, .. } => {
+                ref_allele.push(*ref_base); // Deref to get the value of ref_base
+                if !deleted_bases.is_empty() {
+                    ref_allele.push_str(&String::from_utf8_lossy(deleted_bases));
+                }
+            },
+            VariantObservation::Insertion { ref_base, deleted_bases, .. }
+            | VariantObservation::Deletion { ref_base, deleted_bases, .. } => {
+                ref_allele.push(*ref_base); // Deref to get the value of ref_base
+                if !deleted_bases.is_empty() {
+                    ref_allele.push_str(&String::from_utf8_lossy(deleted_bases));
+                }
+            },
+        }
+
+        ref_allele
+    }
+
+    pub fn get_alternate_allele(&self) -> String {
+        let mut alt_allele = String::new();
+
+        match self {
+            VariantObservation::Snp { base, .. }
+            | VariantObservation::Insertion { base, .. }
+            | VariantObservation::Deletion { base, .. } => {
+                alt_allele.push(*base); // Deref to get the value of base
+            }
+        }
+
+        alt_allele
+    }
+}
+
 
 impl fmt::Display for BaseCall {
     /// Format the BaseCall for display
@@ -364,7 +442,6 @@ impl PartialEq for BaseCall {
         self.base == other.base
             && self.deleted_bases == other.deleted_bases
             && self.insertion_bases == other.insertion_bases
-            && self.indel_filter == other.indel_filter
             && self.is_indel == other.is_indel
     }
 }
@@ -380,7 +457,7 @@ impl Hash for BaseCall {
         self.base.hash(state);
         self.deleted_bases.hash(state);
         self.insertion_bases.hash(state);
-        self.indel_filter.hash(state);
+        self.is_indel.hash(state);
     }
 }
 
@@ -491,11 +568,18 @@ fn validate_fai_and_bam(
 /// A CallingDirective indicating where to call variants
 fn find_where_to_call_variants(
     ref_base: char,
-    alt_candidates: &HashSet<BaseCall>,
+    alt_candidates: &HashSet<VariantObservation>, // Now working with VariantObservation
     upstream_base: char,
     downstream_base: char,
 ) -> CallingDirective {
-    let alt_candidate_bases: HashSet<char> = alt_candidates.iter().map(|bc| bc.base).collect();
+    // Collect bases from VariantObservation
+    let alt_candidate_bases: HashSet<char> = alt_candidates.iter().filter_map(|vo| match vo {
+        VariantObservation::Snp { base, .. }
+        | VariantObservation::Insertion { base, .. }
+        | VariantObservation::Deletion { base, .. } => Some(*base), // Extract base from each variant
+
+        // You can add additional pattern matching here if needed for other variants
+    }).collect();
 
     if ref_base == 'C' && downstream_base == 'G' {
         CallingDirective::ReferenceSiteOb
@@ -509,6 +593,7 @@ fn find_where_to_call_variants(
         CallingDirective::BothStrands
     }
 }
+
 
 /// Generate the VCF header string based on the BAM header
 ///
@@ -568,24 +653,47 @@ fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
 /// # Returns
 /// A set of candidate BaseCall instances
 fn get_count_vec_candidates(
-    counts: &HashMap<BaseCall, usize>,
+    counts: &HashMap<VariantObservation, usize>,
     ref_base: char,
     error_rate: f64,
-) -> HashSet<BaseCall> {
+) -> HashSet<VariantObservation> {
     let mut candidates = HashSet::new();
-
     let total_depth = counts.values().sum::<usize>() as u64;
-    for (basecall, &count) in counts.iter() {
-        if (basecall.base == ref_base && basecall.is_snp()) || basecall.base == 'N' {
-            continue;
+
+    for (variant, &count) in counts.iter() {
+        // Skip if the base is the same as the reference base (for SNPs) or if it's 'N'
+        match variant {
+            VariantObservation::Snp { base, ref_base: _, deleted_bases: _, insertion_bases: _ } 
+                if *base == ref_base => continue, 
+
+            VariantObservation::Snp { base, ref_base: _, deleted_bases: _, insertion_bases: _ } 
+                if *base == 'N' => continue,
+
+            VariantObservation::Insertion { base, ref_base, deleted_bases: _, insertion_bases: _ } 
+                if *base == *ref_base => continue,
+
+            VariantObservation::Insertion { base, ref_base, deleted_bases: _, insertion_bases: _ } 
+                if *base == 'N' => continue, 
+
+            VariantObservation::Deletion { base, ref_base, deleted_bases: _, insertion_bases: _ } 
+                if *base == *ref_base => continue, 
+
+            VariantObservation::Deletion { base, ref_base, deleted_bases: _, insertion_bases: _ } 
+                if *base == 'N' => continue, 
+
+            _ => {} 
         }
+
+        // Calculate p-value for determining if the variant is significant
         let pval = right_tail_binomial_pval(total_depth, count as u64, error_rate);
         if pval < 0.05 {
-            candidates.insert(basecall.clone());
+            candidates.insert(variant.clone());
         }
     }
+
     candidates
 }
+
 
 /// Assign genotype based on binomial probabilities
 ///
@@ -732,23 +840,12 @@ fn filter_indels(sequence: &[u8], record: &bam::Record, homopolymer_cutoff: usiz
     dinuc_end ||
     soft_clipped
 }
-
-
-/// Extract base call counts from a pileup
-///
-/// # Arguments
-/// * `pileup` - The pileup to extract counts from
-/// * `min_bq` - Minimum base quality
-/// * `min_mapq` - Minimum mapping quality
-/// * `end_of_read_cutoff` - End of read cutoff for SNPs
-/// * `indel_end_of_read_cutoff` - End of read cutoff for indels
-/// * `max_mismatches` - Maximum allowed mismatches in a read
-/// * `ref_seq` - The reference sequence as a byte vector
-/// * `ref_pos` - The reference position
-///
-/// # Returns
-/// A tuple of three SNP hashmaps: (R1 forward counts, R1 reverse counts, total counts)
-//  And three indel hashmaps: (R1 forward indel counts, R1 reverse indel counts, total indel counts)
+#[derive(Debug)]
+struct Counts {
+    fwd: HashMap<VariantObservation, usize>,
+    rev: HashMap<VariantObservation, usize>,
+    total: HashMap<VariantObservation, usize>,
+}
 fn extract_pileup_counts(
     pileup: &Pileup,
     min_bq: usize,
@@ -759,21 +856,13 @@ fn extract_pileup_counts(
     ref_seq: &[u8],
     ref_pos: u32,
     stranded_read: &ReadNumber,
-) -> (
-    HashMap<BaseCall, usize>,
-    HashMap<BaseCall, usize>,
-    HashMap<BaseCall, usize>,
-    HashMap<BaseCall, usize>,
-    HashMap<BaseCall, usize>,
-    HashMap<BaseCall, usize>,
-) {
-    let mut r_one_f_counts_snps = HashMap::new();
-    let mut r_one_r_counts_snps = HashMap::new();
-    let mut r_one_f_counts_indels = HashMap::new();
-    let mut r_one_r_counts_indels = HashMap::new();
+) -> Counts {
 
-    let mut total_counts_snps = HashMap::new();
-    let mut total_counts_indels = HashMap::new();
+    let mut counts = Counts {
+        fwd: HashMap::new(),
+        rev: HashMap::new(),
+        total: HashMap::new(),
+    };
 
     for alignment in pileup.alignments() {
         let record = alignment.record();
@@ -786,16 +875,13 @@ fn extract_pileup_counts(
             let base = record.seq().as_bytes()[qpos] as char;
             let qual = record.qual()[qpos];
             let mapq = record.mapq();
-            let is_del = alignment.is_del();
-            let is_refskip = alignment.is_refskip();
 
-            if is_del || is_refskip {
+            if alignment.is_del() || alignment.is_refskip() {
                 continue;
             }
             if base == 'N' {
                 continue;
             }
-
             if qual < min_bq as u8 {
                 continue;
             }
@@ -808,64 +894,51 @@ fn extract_pileup_counts(
             }
 
             let base_call = BaseCall::new(&alignment, ref_seq, ref_pos);
-
-            let read_len = record.seq().len();
-            if base_call.is_snp() {
-                if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
-                    continue;
-                }
-            } else if qpos < indel_end_of_read_cutoff || qpos >= read_len - indel_end_of_read_cutoff
-            {
+            if base_call.is_indel && base_call.indel_filter {
                 continue;
             }
 
-            let is_stranded_read_status = is_stranded_read(&record, stranded_read);
+            let read_len = record.seq().len();
 
-            if (record.is_reverse() && is_stranded_read_status)
-                || (!record.is_reverse() && !is_stranded_read_status)
-            {
-                if !base_call.is_indel {
-                    r_one_r_counts_snps.insert(
-                        base_call.clone(),
-                        r_one_r_counts_snps.get(&base_call).unwrap_or(&0) + 1,
-                    );
-                }
-                if !base_call.indel_filter && base_call.is_indel {
-                    r_one_r_counts_indels.insert(
-                        base_call.clone(),
-                        r_one_r_counts_indels.get(&base_call).unwrap_or(&0) + 1,
-                    );
+            // end-of-read filtering (different for SNP vs indel)
+            if base_call.is_snp() {
+                if qpos < end_of_read_cutoff
+                    || qpos >= read_len - end_of_read_cutoff {
+                    continue;
                 }
             } else {
-                if !base_call.is_indel {
-                    r_one_f_counts_snps.insert(
-                        base_call.clone(),
-                        r_one_f_counts_snps.get(&base_call).unwrap_or(&0) + 1,
-                    );
-                }
-                if !base_call.indel_filter && base_call.is_indel {
-                    r_one_f_counts_indels.insert(
-                        base_call.clone(),
-                        r_one_f_counts_indels.get(&base_call).unwrap_or(&0) + 1,
-                    );
+                if qpos < indel_end_of_read_cutoff
+                    || qpos >= read_len - indel_end_of_read_cutoff {
+                    continue;
                 }
             }
-            if !base_call.indel_filter && base_call.is_indel {
-                total_counts_indels.insert(
-                    base_call.clone(),
-                    total_counts_indels.get(&base_call).unwrap_or(&0) + 1,
-                );
+
+            // convert to a hashable variant type
+            let obs = VariantObservation::from(&base_call);
+
+            // strand handling
+            let is_stranded = is_stranded_read(&record, stranded_read);
+            let is_rev_strand = (record.is_reverse() && is_stranded)
+                || (!record.is_reverse() && !is_stranded);
+
+            if is_rev_strand {
+                counts.rev.entry(obs.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+            } else {
+                counts.fwd.entry(obs.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
             }
-            if !base_call.is_indel {
-                total_counts_snps.insert(
-                    base_call.clone(),
-                    total_counts_snps.get(&base_call).unwrap_or(&0) + 1,
-                );
-            }
+
+            // total count
+            counts.total.entry(obs)
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
         }
     }
 
-    (r_one_f_counts_snps, r_one_r_counts_snps, r_one_f_counts_indels, r_one_r_counts_indels, total_counts_indels, total_counts_snps)
+    counts
 }
 
 /// Main workflow for variant calling
@@ -1054,7 +1127,7 @@ fn call_variants(
         if depth == 0 {
             continue;
         }
-        let (r_one_f_counts_snps, r_one_r_counts_snps, r_one_f_counts_indels, r_one_r_counts_indels, total_counts_indels, total_counts_snps) = extract_pileup_counts(
+        let counts = extract_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1065,10 +1138,51 @@ fn call_variants(
             pos,
             stranded_read,
         );
+        let mut r_one_f_counts_snps   = HashMap::new();
+        let mut r_one_r_counts_snps   = HashMap::new();
+        let mut r_one_f_counts_indels = HashMap::new();
+        let mut r_one_r_counts_indels = HashMap::new();
 
-        let mut all_found_alts: HashSet<&BaseCall> = HashSet::new();
-        all_found_alts.extend(r_one_f_counts_snps.keys());
-        all_found_alts.extend(r_one_r_counts_snps.keys());
+        let mut total_counts_snps   = HashMap::new();
+        let mut total_counts_indels = HashMap::new();
+        let mut total_counts        = HashMap::new();
+        for (obs, count) in &counts.fwd {
+            match obs {
+                VariantObservation::Snp { .. } => {
+                    r_one_f_counts_snps.insert(obs.clone(), *count);
+                }
+                VariantObservation::Insertion { .. } |
+                VariantObservation::Deletion  { .. } => {
+                    r_one_f_counts_indels.insert(obs.clone(), *count);
+                }
+            }
+        }
+
+        for (obs, count) in &counts.rev {
+            match obs {
+                VariantObservation::Snp { .. } => {
+                    r_one_r_counts_snps.insert(obs.clone(), *count);
+                }
+                VariantObservation::Insertion { .. } |
+                VariantObservation::Deletion  { .. } => {
+                    r_one_r_counts_indels.insert(obs.clone(), *count);
+                }
+            }
+        }
+
+        for (obs, count) in &counts.total {
+            total_counts.insert(obs.clone(), *count);
+
+            match obs {
+                VariantObservation::Snp { .. } => {
+                    total_counts_snps.insert(obs.clone(), *count);
+                }
+                VariantObservation::Insertion { .. } |
+                VariantObservation::Deletion  { .. } => {
+                    total_counts_indels.insert(obs.clone(), *count);
+                }
+            }
+        }
 
         let upstream_base = if pos > 0 {
             ref_seq[pos as usize - 1]
@@ -1097,7 +1211,7 @@ fn call_variants(
             downstream_base as char,
         );
 
-        let (candidate_snps, counts_snps): (HashSet<BaseCall>, HashMap<BaseCall, usize>) = match directive_snps {
+        let (candidate_snps, counts_snps): (HashSet<VariantObservation>, HashMap<VariantObservation, usize>) = match directive_snps {
             CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => {
                 (r_one_r_candidates_snps.clone(), r_one_r_counts_snps.clone())
             }
@@ -1119,7 +1233,7 @@ fn call_variants(
             downstream_base as char,
         );
 
-        let (candidate_indels, counts_indels): (HashSet<BaseCall>, HashMap<BaseCall, usize>) = match directive_indels {
+        let (candidate_indels, counts_indels): (HashSet<VariantObservation>, HashMap<VariantObservation, usize>) = match directive_indels {
             CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => {
                 (r_one_r_candidates_indels.clone(), r_one_r_counts_indels.clone())
             }
@@ -1241,7 +1355,8 @@ mod tests {
         // * `$fn_name` - Name of the test function
         // * `$bam_file` - BAM file to use for the test
         // * `$pos` - Position of the variant
-        // * `$ref_base` - Expected reference base
+        // * `$ref_base` - 
+        // pected reference base
         // * `$alt_base` - Expected alternate base
         // * `$gt` - Expected genotype
         // * `$stranded_read` - Which read is stranded
