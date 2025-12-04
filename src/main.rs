@@ -19,8 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tracing::{info};
-use tracing_subscriber;
+use tracing::info;
 use tracing_subscriber::fmt as subscriber_fmt;
 use tracing_subscriber::EnvFilter;
 
@@ -43,8 +42,8 @@ impl LogLevel {
     fn as_str(&self) -> &'static str {
         match self {
             LogLevel::Error => "error",
-            LogLevel::Warn  => "warn",
-            LogLevel::Info  => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
             LogLevel::Debug => "debug",
             LogLevel::Trace => "trace",
         }
@@ -810,7 +809,6 @@ pub fn workflow(
     error_rate: f64,
     stranded_read: &ReadNumber,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     info!("Starting TVC workflow");
     validate_fai_and_bam(ref_path, bam_path)?;
 
@@ -1072,7 +1070,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let error_rate = args.error_rate;
     let stranded_read = &args.stranded_read;
 
-     let level = args.log_level.as_str(); // use the enum value from clap
+    let level = args.log_level.as_str(); // use the enum value from clap
 
     subscriber_fmt()
         .with_env_filter(EnvFilter::new(level))
