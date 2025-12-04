@@ -108,9 +108,6 @@ Please see how we calculate F1 scores and it's current performance on a demo dat
 
 We have other methylation based scripts in our [taps foundry](https://github.com/watchmaker-genomics/taps-foundry)
 
-You can view our analysis best practices documentation here.
-
-
 
 ## Development
 
