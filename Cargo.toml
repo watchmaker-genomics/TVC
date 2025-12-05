@@ -1,6 +1,6 @@
 [package]
 name = "tvc"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -12,3 +12,5 @@ bio = "1.4"
 statrs = "0.16"
 rayon = "1.7"
 indicatif = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

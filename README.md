@@ -67,6 +67,7 @@ tvc [OPTIONS] <INPUT_REF> <INPUT_BAM> <OUTPUT_VCF>
 | `-c, --chunk-size <CHUNK_SIZE>` | Number of reference bases processed per thread batch | `1,000,000` |
 | `-p, --error-rate <ERROR_RATE>` | Estimated per-base sequencing error rate used for binomial modeling | `0.005` |
 | `-r, --stranded_read <READ_NUMBER>` | The read that is in the same orientation of the molecule (r1/r2) | `r1`|
+| `-l, --log-level <LOG_LEVEL>`| The desired level of logging can be [error, warn, info, debug, trace]| `info`|
 | `-h, --help` | Print help message | — |
 
 ---
@@ -106,9 +107,6 @@ tvc \
 Please see how we calculate F1 scores and it's current performance on a demo data set in [this notebook](analysis/TVC_benchmarking.ipynb).
 
 We have other methylation based scripts in our [taps foundry](https://github.com/watchmaker-genomics/taps-foundry)
-
-You can view our analysis best practices documentation here.
-
 
 
 ## Development

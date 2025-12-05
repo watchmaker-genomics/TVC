@@ -19,11 +19,35 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use tracing::info;
+use tracing_subscriber::fmt as subscriber_fmt;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum ReadNumber {
     R1,
     R2,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
 }
 
 /// Input arguments for the Taps Variant Caller
@@ -66,6 +90,9 @@ struct Args {
 
     #[arg(short = 'r', long, value_enum, default_value_t = ReadNumber::R1)]
     stranded_read: ReadNumber,
+
+    #[arg(short = 'l', long, value_enum, default_value_t = LogLevel::Info)]
+    log_level: LogLevel,
 }
 
 /// Representation of a genomic variant
@@ -782,8 +809,10 @@ pub fn workflow(
     error_rate: f64,
     stranded_read: &ReadNumber,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting TVC workflow");
     validate_fai_and_bam(ref_path, bam_path)?;
 
+    info!("Reading reference sequences");
     let ref_reader = faidx::Reader::from_path(ref_path)?;
     let contigs: Vec<String> = ref_reader.seq_names()?;
 
@@ -799,13 +828,15 @@ pub fn workflow(
         seq_name_to_seq.insert(contig.clone(), ref_seq);
     }
 
+    info!("Dividing genome into chunks and getting ready for parallel processing");
+
     let chunks: Vec<GenomeChunk> = get_genome_chunks(ref_path, chunk_size);
 
     let pb = ProgressBar::new(chunks.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} chunks",
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} chunks processed",
             )?
             .progress_chars("#>-"),
     );
@@ -1038,6 +1069,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk_size = args.chunk_size;
     let error_rate = args.error_rate;
     let stranded_read = &args.stranded_read;
+
+    let level = args.log_level.as_str(); // use the enum value from clap
+
+    subscriber_fmt()
+        .with_env_filter(EnvFilter::new(level))
+        .with_target(false)
+        .init();
 
     workflow(
         bam_path,
