@@ -550,7 +550,6 @@ fn find_where_to_call_variants(
         VariantObservation::Snp { base, .. }
         | VariantObservation::Insertion { base, .. }
         | VariantObservation::Deletion { base, .. } => {
-            println!("FIND_WHERE_TO_CALL_VARIANTS Alt Candidate Base: {}", base);
             Some(*base)
         }
 
@@ -883,9 +882,6 @@ fn extract_pileup_counts(
 
             // convert to a hashable variant type
             let obs = VariantObservation::from(&base_call);
-            if !base_call.is_snp() {
-                println!("EXTR_PILEUP_COUNTS Observation: {:?}", obs.clone());
-            }
 
             // strand handling
             let is_stranded = is_stranded_read(&record, stranded_read);
@@ -907,9 +903,6 @@ fn extract_pileup_counts(
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
             
-            if !base_call.is_snp() {
-                println!("EXTR_PILEUP_COUNTS Counts Total: {:?}", counts.total);
-            }
         }
     }
 
@@ -1129,7 +1122,6 @@ fn call_variants(
                 VariantObservation::Insertion { .. } |
                 VariantObservation::Deletion  { .. } => {
                     r_one_f_counts_indels.insert(obs.clone(), *count);
-                    println!("CALL_VARIANTS Forward INDEL counts: {:?}", r_one_f_counts_indels.clone());
                 }
             }
         }
@@ -1142,7 +1134,6 @@ fn call_variants(
                 VariantObservation::Insertion { .. } |
                 VariantObservation::Deletion  { .. } => {
                     r_one_r_counts_indels.insert(obs.clone(), *count);
-                    println!("CALL_VARIANTS Reverse INDEL counts: {:?}", r_one_r_counts_indels.clone());
                 }
             }
         }
@@ -1157,7 +1148,6 @@ fn call_variants(
                 VariantObservation::Insertion { .. } |
                 VariantObservation::Deletion  { .. } => {
                     total_counts_indels.insert(obs.clone(), *count);
-                    println!("CALL_VARIANTS Total INDEL counts: {:?}", total_counts_indels.clone());
                 }
             }
         }
@@ -1278,9 +1268,7 @@ fn call_variants(
                     directive_indels.clone(),
                 );
                 
-                println!("CALL_VARIANTS Detected INDEL Variant: {:?}", variant);
                 let total_depth = total_depth_snps + total_depth_indels;
-                println!("CALL_VARIANTS Total Depth at position {}: {}", pos + 1, total_depth);
                 variants.push(variant);
             }
         }
