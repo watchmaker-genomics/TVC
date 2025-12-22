@@ -553,7 +553,6 @@ fn find_where_to_call_variants(
             Some(*base)
         }
 
-        // You can add additional pattern matching here if needed for other variants
     }).collect();
 
     if ref_base == 'C' && downstream_base == 'G' {
@@ -864,9 +863,9 @@ fn extract_pileup_counts(
 
             let base_call = BaseCall::new(&alignment, ref_seq, ref_pos);
 
-            if base_call.is_indel && base_call.indel_filter {
-                continue;
-            }
+            // if base_call.is_indel && base_call.indel_filter {
+            //     continue;
+            // }
 
             let read_len = record.seq().len();
 
@@ -1221,7 +1220,7 @@ fn call_variants(
         let total_depth_snps = counts_snps.values().sum::<usize>() as u64;
         let total_depth_indels = counts_indels.values().sum::<usize>() as u64;
         let total_depth = total_depth_snps + total_depth_indels;
-        if !candidate_snps.is_empty() && total_depth >= min_depth as u64 {
+        if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
             for candidate in candidate_snps {
                 let alt_counts = counts_snps.get(&candidate).unwrap_or(&0);
                 if *alt_counts < min_ao as usize {
@@ -1247,7 +1246,7 @@ fn call_variants(
             }
         }
 
-        if !candidate_indels.is_empty() && total_depth >= min_depth as u64 {
+        if !candidate_indels.is_empty() && total_depth_indels >= min_depth as u64 {
             for candidate in candidate_indels {
                 let alt_counts = counts_indels.get(&candidate).unwrap_or(&0);
                 if *alt_counts < min_ao as usize {
