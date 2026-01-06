@@ -682,8 +682,7 @@ fn get_count_vec_candidates(
     candidates
 }
 
-
-/// Assign genotype based on binomial probabilities
+/// Assign genotype based on binomial probabilities for SNPs
 ///
 /// # Arguments
 /// * `alt_counts` - Count of reads supporting the alternate allele
@@ -692,7 +691,40 @@ fn get_count_vec_candidates(
 ///
 /// # Returns
 /// A Genotype instance with assigned genotype and quality score
-fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype {
+fn assign_genotype_snps(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype {
+    let homo_ref_prob = Binomial::new(error_rate, depth as u64)
+        .unwrap()
+        .pmf(alt_counts as u64);
+    let het_prob = Binomial::new(0.5, depth as u64)
+        .unwrap()
+        .pmf(alt_counts as u64);
+    let homo_alt_prob = Binomial::new(1.0 - error_rate, depth as u64)
+        .unwrap()
+        .pmf(alt_counts as u64);
+
+    let total = homo_ref_prob + het_prob + homo_alt_prob;
+
+    let (gt, best_prob) = if homo_ref_prob > het_prob && homo_ref_prob > homo_alt_prob {
+        ("0/0", homo_ref_prob)
+    } else if het_prob > homo_ref_prob && het_prob > homo_alt_prob {
+        ("0/1", het_prob)
+    } else {
+        ("1/1", homo_alt_prob)
+    };
+
+    Genotype::new(gt, best_prob, total)
+}
+
+/// Assign genotype based on binomial probabilities for Indels
+///
+/// # Arguments
+/// * `alt_counts` - Count of reads supporting the alternate allele
+/// * `depth` - Total read depth at the position
+/// * `error_rate` - Expected general error rate
+///
+/// # Returns
+/// A Genotype instance with assigned genotype and quality score
+fn assign_genotype_indels(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype {
     let homo_ref_prob = Binomial::new(error_rate, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
@@ -1178,7 +1210,7 @@ fn call_variants(
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, total_depth as usize, error_rate);
+                let genotype = assign_genotype_snps(*alt_counts, total_depth as usize, error_rate);
                 if genotype.genotype == "0/0" {
                     continue;
                 }
@@ -1204,7 +1236,7 @@ fn call_variants(
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, total_depth as usize, error_rate);
+                let genotype = assign_genotype_indels(*alt_counts, total_depth as usize, error_rate);
                 if genotype.genotype == "0/0" {
                     continue;
                 }
@@ -1537,7 +1569,7 @@ mod tests {
             20,              // indel_end_of_read_cutoff
             10,              // max_mismatches
             1,               // min_ao
-            0.005,           // error_rate
+            0.05,           // error_rate
             &ReadNumber::R1, // stranded_read
         )
         .expect("call_variants failed");
