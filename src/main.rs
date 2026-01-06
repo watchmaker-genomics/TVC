@@ -251,7 +251,8 @@ enum CallingDirective {
 struct BaseCall {
     base: char,
     ref_base: char,
-    deleted_bases: Vec<u8>,    insertion_bases: Vec<u8>,
+    deleted_bases: Vec<u8>,
+    insertion_bases: Vec<u8>,
 }
 
 impl BaseCall {
@@ -304,12 +305,13 @@ impl BaseCall {
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
+/// Representation of a variant observation
 enum VariantObservation {
     Snp { base: char, ref_base: char, deleted_bases: Vec<u8>, insertion_bases: Vec<u8> },
     Insertion { base: char, ref_base: char, deleted_bases: Vec<u8>, insertion_bases: Vec<u8> },
     Deletion { base: char, ref_base: char, deleted_bases: Vec<u8>, insertion_bases: Vec<u8>  },
 }
-
+/// Convert a BaseCall to a VariantObservation
 impl From<&BaseCall> for VariantObservation {
     fn from(bc: &BaseCall) -> Self {
         if !bc.insertion_bases.is_empty() {
@@ -336,13 +338,14 @@ impl From<&BaseCall> for VariantObservation {
         }
     }
 }
+/// Methods for VariantObservation
 impl VariantObservation {
     fn get_reference_allele(&self) -> String {
         let mut ref_allele = String::new();
 
         match self {
             VariantObservation::Snp { ref_base, deleted_bases, .. } => {
-                ref_allele.push(*ref_base); // Deref to get the value of ref_base
+                ref_allele.push(*ref_base); 
                 if !deleted_bases.is_empty() {
                     ref_allele.push_str(&String::from_utf8_lossy(deleted_bases));
                 }
@@ -359,6 +362,10 @@ impl VariantObservation {
         ref_allele
     }
 
+    /// Get the alternate allele string
+    ///
+    /// # Returns
+    /// A string representing the alternate allele
     fn get_alternate_allele(&self) -> String {
         let mut alt_allele = String::new();
 
@@ -556,7 +563,6 @@ fn find_where_to_call_variants(
     }
 }
 
-
 /// Generate the VCF header string based on the BAM header
 ///
 /// # Arguments
@@ -720,11 +726,27 @@ fn is_stranded_read(record: &bam::Record, stranded_read: &ReadNumber) -> bool {
 }
 
 #[derive(Debug)]
+/// Counts of variant observations
 struct Counts {
     fwd: HashMap<VariantObservation, usize>,
     rev: HashMap<VariantObservation, usize>,
     total: HashMap<VariantObservation, usize>,
 }
+
+/// Extract base call counts from a pileup
+///
+/// # Arguments
+/// * `pileup` - The pileup to extract counts from
+/// * `min_bq` - Minimum base quality
+/// * `min_mapq` - Minimum mapping quality
+/// * `end_of_read_cutoff` - End of read cutoff for SNPs
+/// * `indel_end_of_read_cutoff` - End of read cutoff for indels
+/// * `max_mismatches` - Maximum allowed mismatches in a read
+/// * `ref_seq` - The reference sequence as a byte vector
+/// * `ref_pos` - The reference position
+///
+/// # Returns
+/// A Counts instance with extracted counts
 fn extract_pileup_counts(
     pileup: &Pileup,
     min_bq: usize,
@@ -777,8 +799,7 @@ fn extract_pileup_counts(
             let read_len = record.seq().len();
 
             if base_call.is_snp() {
-                if qpos < end_of_read_cutoff
-                    || qpos >= read_len - end_of_read_cutoff {
+                if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
                     continue;
                 }
             } else if qpos < indel_end_of_read_cutoff || qpos >= read_len - indel_end_of_read_cutoff
@@ -1098,7 +1119,7 @@ fn call_variants(
                 total_counts_snps.clone(),
             ),
         };
-        
+        // Hardcoded to BothStrands for indels for now
         let directive_indels = CallingDirective::BothStrands;
 
         let (candidate_indels, counts_indels): (HashSet<VariantObservation>, HashMap<VariantObservation, usize>) = match directive_indels {
@@ -1226,8 +1247,7 @@ mod tests {
         // * `$fn_name` - Name of the test function
         // * `$bam_file` - BAM file to use for the test
         // * `$pos` - Position of the variant
-        // * `$ref_base` - 
-        // pected reference base
+        // * `$ref_base` - Expected reference base
         // * `$alt_base` - Expected alternate base
         // * `$gt` - Expected genotype
         // * `$stranded_read` - Which read is stranded
