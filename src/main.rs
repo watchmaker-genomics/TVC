@@ -732,7 +732,7 @@ fn assign_genotype_indels(alt_counts: usize, depth: usize, error_rate: f64) -> G
     let het_prob = Binomial::new(0.4, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
-    let homo_alt_prob = Binomial::new(0.9 - error_rate, depth as u64)
+    let homo_alt_prob = Binomial::new(1.0 - error_rate, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
 
@@ -943,11 +943,11 @@ fn extract_pileup_counts(
             {
                 continue;
             }
-            // additional indel filtering
-            if !base_call.is_snp() {
+
+            if !base_call.is_snp() && base_call.insertion_bases.is_empty() && base_call.deleted_bases.is_empty() {
                 let read_seq = record.seq().as_bytes();
                 if filter_indels(&read_seq, &record, 3) {
-                    continue;
+                    continue; // skip this read
                 }
             }
 
@@ -970,7 +970,7 @@ fn extract_pileup_counts(
             }
 
             // total count
-            counts.total.entry(obs)
+            counts.total.entry(obs.clone())
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
             
@@ -1186,7 +1186,6 @@ fn call_variants(
 
         let mut total_counts_snps   = HashMap::new();
         let mut total_counts_indels = HashMap::new();
-        let mut total_counts        = HashMap::new();
         for (obs, count) in &counts.fwd {
             match obs {
                 VariantObservation::Snp { .. } => {
@@ -1212,8 +1211,6 @@ fn call_variants(
         }
 
         for (obs, count) in &counts.total {
-            total_counts.insert(obs.clone(), *count);
-
             match obs {
                 VariantObservation::Snp { .. } => {
                     total_counts_snps.insert(obs.clone(), *count);
