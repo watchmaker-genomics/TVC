@@ -729,7 +729,7 @@ fn assign_genotype_indels(alt_counts: usize, depth: usize, error_rate: f64) -> G
     let homo_ref_prob = Binomial::new(error_rate, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
-    let het_prob = Binomial::new(0.4, depth as u64)
+    let het_prob = Binomial::new(0.5, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
     let homo_alt_prob = Binomial::new(1.0 - error_rate, depth as u64)
@@ -944,12 +944,12 @@ fn extract_pileup_counts(
                 continue;
             }
 
-            // if !base_call.is_snp() && base_call.base == base_call.ref_base {
-            //     let read_seq = record.seq().as_bytes();
-            //     if filter_indels(&read_seq, &record, 3) {
-            //         continue; // skip this read
-            //     }
-            // }
+            if !base_call.is_snp() && base_call.base == base_call.ref_base {
+                let read_seq = record.seq().as_bytes();
+                if filter_indels(&read_seq, &record, 3) {
+                    continue; // skip this read
+                }
+            }
 
             // convert to a hashable variant type
             let obs = VariantObservation::from(&base_call);
