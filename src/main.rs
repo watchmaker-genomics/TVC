@@ -925,12 +925,12 @@ fn extract_pileup_counts(
                 continue;
             }
 
-            // if !base_call.is_snp() && base_call.base == base_call.ref_base {
-            //     let read_seq = record.seq().as_bytes();
-            //     if filter_indels(&read_seq, &record, 3) {
-            //         continue; // skip this read
-            //     }
-            // }
+            if base_call.is_snp() && base_call.base == base_call.ref_base {
+                let read_seq = record.seq().as_bytes();
+                if filter_indels(&read_seq, &record, 3) {
+                    continue; // skip this read
+                }
+            }
 
             // convert to a hashable variant type
             let obs = VariantObservation::from(&base_call);
