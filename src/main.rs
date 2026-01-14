@@ -710,10 +710,10 @@ fn assign_genotype_indels(alt_counts: usize, depth: usize, error_rate: f64) -> G
     let homo_ref_prob = Binomial::new(error_rate, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
-    let het_prob = Binomial::new(0.3, depth as u64)
+    let het_prob = Binomial::new(0.5, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
-    let homo_alt_prob = Binomial::new(0.95 - error_rate, depth as u64)
+    let homo_alt_prob = Binomial::new(1.0 - error_rate, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
 
