@@ -772,6 +772,7 @@ struct Counts {
     fwd: HashMap<VariantObservation, usize>,
     rev: HashMap<VariantObservation, usize>,
     total: HashMap<VariantObservation, usize>,
+    indel_offset: HashMap<VariantObservation, usize>,
 }
 
 /// Returns true if the read should be filtered out for INDEL calling
@@ -881,6 +882,7 @@ fn extract_pileup_counts(
         fwd: HashMap::new(),
         rev: HashMap::new(),
         total: HashMap::new(),
+        indel_offset: HashMap::new(),
     };
 
     for alignment in pileup.alignments() {
@@ -925,13 +927,6 @@ fn extract_pileup_counts(
                 continue;
             }
 
-            if base_call.is_snp() && base_call.base == base_call.ref_base {
-                let read_seq = record.seq().as_bytes();
-                if filter_indels(&read_seq, &record, 3) {
-                    continue; // skip this read
-                }
-            }
-
             // convert to a hashable variant type
             let obs = VariantObservation::from(&base_call);
 
@@ -954,7 +949,15 @@ fn extract_pileup_counts(
             counts.total.entry(obs.clone())
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
-            
+
+            if base_call.is_snp() && base_call.base == base_call.ref_base {
+                let read_seq = record.seq().as_bytes();
+                if filter_indels(&read_seq, &record, 3) {
+                    counts.indel_offset.entry(obs.clone())
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
+                }
+            }
         }
     }
 
@@ -1267,6 +1270,12 @@ fn call_variants(
         let total_depth_snps = counts_snps.values().sum::<usize>() as u64;
         let total_depth_indels = counts_indels.values().sum::<usize>() as u64;
         let total_depth = total_depth_snps + total_depth_indels;
+        let indel_offset = counts.indel_offset.values().sum::<usize>() as u64;
+        let total_depth_indel_adjusted = if total_depth > indel_offset {
+            total_depth - indel_offset
+        } else {
+            0
+        };
         if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
             for candidate in candidate_snps {
                 let alt_counts = counts_snps.get(&candidate).unwrap_or(&0);
@@ -1300,7 +1309,7 @@ fn call_variants(
                     continue;
                 }
                 // Hard coded 0.05 for indels for now
-                let genotype = assign_genotype_indels(*alt_counts, total_depth as usize, 0.05);
+                let genotype = assign_genotype_indels(*alt_counts, total_depth_indel_adjusted as usize, 0.05);
                 if genotype.genotype == "0/0" {
                     continue;
                 }
@@ -1312,11 +1321,10 @@ fn call_variants(
                     candidate.get_alternate_allele(),
                     genotype.genotype,
                     genotype.score,
-                    total_depth as u32,
+                    total_depth_indel_adjusted as u32,
                     *alt_counts as u32,
                     directive_indels.clone(),
                 );
-                
                 variants.push(variant);
             }
         }
