@@ -904,11 +904,12 @@ fn extract_pileup_counts(
     ref_pos: u32,
     stranded_read: &ReadNumber,
     counts: &mut Counts,
-) {
+) -> u64 {
     counts.fwd.clear();
     counts.rev.clear();
     counts.total.clear();
-    counts.indel_offset.clear();
+    
+    let mut indel_offset = 0;
     
     for alignment in pileup.alignments() {
         let record = alignment.record();
@@ -971,17 +972,18 @@ fn extract_pileup_counts(
             counts.total.entry(obs.clone())
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
-
+            
             if base_call.is_not_indel() && base_call.base == base_call.ref_base {
                 let read_seq = record.seq().as_bytes();
                 if filter_indels(&read_seq, &record, 3) {
-                    counts.indel_offset.entry(obs.clone())
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
+                    indel_offset += 1;
                 }
             }
         }
     }
+
+    indel_offset
+
 }
 
 /// Main workflow for variant calling
@@ -1189,7 +1191,7 @@ fn call_variants(
         if depth < min_depth {
             continue;
         }
-        extract_pileup_counts(
+        let indel_offset = extract_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1299,7 +1301,6 @@ fn call_variants(
         let total_depth_snps = counts_snps.values().sum::<usize>() as u64;
         let total_depth_indels = counts_indels.values().sum::<usize>() as u64;
         let total_depth = total_depth_snps + total_depth_indels;
-        let indel_offset = counts.indel_offset.values().sum::<usize>() as u64;
         let total_depth_filtered = if total_depth > indel_offset {
             total_depth - indel_offset
         } else {
