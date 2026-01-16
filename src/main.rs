@@ -9,7 +9,7 @@ use rust_htslib::bam::pileup::Pileup;
 use rust_htslib::bam::record::Cigar;
 use rust_htslib::bam::{self, Read};
 use rust_htslib::faidx;
-use statrs::distribution::{Binomial, Discrete};
+use statrs::distribution::{Binomial, Discrete, DiscreteCDF};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
@@ -626,6 +626,21 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
     )
 }
 
+/// Calculate the right-tail p-value for a binomial distribution
+///
+/// # Arguments
+/// * `n` - Number of trials
+/// * `k` - Number of successes
+/// * `p` - Probability of success on each trial
+///
+/// # Returns
+/// Right-tail p-value
+fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
+    let binom = Binomial::new(p, n).expect("Failed to create binomial dist");
+    let cdf = binom.cdf(k - 1);
+    1.0 - cdf
+}
+
 /// Identify candidate base calls based on statistical significance
 ///
 /// # Arguments
@@ -635,7 +650,51 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ///
 /// # Returns
 /// A set of candidate VariantObservation instances
-fn get_count_vec_candidates(
+fn get_count_vec_candidates_snps(
+    counts: &HashMap<VariantObservation, usize>,
+    _ref_base: char,
+    error_rate: f64,
+) -> HashSet<VariantObservation> {
+    let mut candidates = HashSet::new();
+    let total_depth = counts.values().sum::<usize>() as u64;
+
+    for (variant, &count) in counts.iter() {
+        match variant {
+            VariantObservation::Snp { base, ref_base, deleted_bases: _, insertion_bases: _ } 
+                if *base == *ref_base => continue, 
+
+            VariantObservation::Snp { base, ref_base: _, deleted_bases: _, insertion_bases: _ } 
+                if *base == 'N' => continue,
+
+            VariantObservation::Insertion { base, ref_base: _, deleted_bases: _, insertion_bases: _ } 
+                if *base == 'N' => continue, 
+
+            VariantObservation::Deletion { base, ref_base: _, deleted_bases: _, insertion_bases: _ } 
+                if *base == 'N' => continue, 
+
+            _ => {} 
+        }
+
+        // Calculate p-value for determining if the variant is significant
+        let pval = right_tail_binomial_pval(total_depth, count as u64, error_rate);
+        if pval < 0.05 {
+            candidates.insert(variant.clone());
+        }
+    }
+
+    candidates
+}
+
+/// Identify candidate base calls based on statistical significance
+///
+/// # Arguments
+/// * `counts` - A hashmap of VariantObservation to their counts
+/// * `ref_base` - Reference base at the position
+/// * `error_rate` - Expected general error rate
+///
+/// # Returns
+/// A set of candidate VariantObservation instances
+fn get_count_vec_candidates_indels(
     counts: &HashMap<VariantObservation, usize>,
     _ref_base: char,
 ) -> HashSet<VariantObservation> {
@@ -659,6 +718,7 @@ fn get_count_vec_candidates(
         }
 
         candidates.insert(variant.clone());
+        
     }
 
     candidates
@@ -1197,13 +1257,13 @@ fn call_variants(
         };
 
         let r_one_f_candidates_snps =
-            get_count_vec_candidates(&r_one_f_counts_snps, ref_base as char);
+            get_count_vec_candidates_snps(&r_one_f_counts_snps, ref_base as char, error_rate);
         let r_one_r_candidates_snps =
-            get_count_vec_candidates(&r_one_r_counts_snps, ref_base as char);
+            get_count_vec_candidates_snps(&r_one_r_counts_snps, ref_base as char, error_rate);
         let r_one_r_candidates_indels = 
-            get_count_vec_candidates(&r_one_r_counts_indels, ref_base as char);
+            get_count_vec_candidates_indels(&r_one_r_counts_indels, ref_base as char);
         let r_one_f_candidates_indels =
-            get_count_vec_candidates(&r_one_f_counts_indels, ref_base as char);
+            get_count_vec_candidates_indels(&r_one_f_counts_indels, ref_base as char);
 
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
