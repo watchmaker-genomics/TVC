@@ -799,7 +799,6 @@ struct Counts {
     fwd: HashMap<VariantObservation, usize>,
     rev: HashMap<VariantObservation, usize>,
     total: HashMap<VariantObservation, usize>,
-    indel_offset: HashMap<VariantObservation, usize>,
 }
 
 /// Returns true if the read should be filtered out for INDEL calling
@@ -1168,7 +1167,6 @@ fn call_variants(
         fwd: HashMap::with_capacity(8),
         rev: HashMap::with_capacity(8),
         total: HashMap::with_capacity(8),
-        indel_offset: HashMap::with_capacity(4),
     };
 
     let mut r_one_f_counts_snps   = HashMap::with_capacity(4);
@@ -1414,6 +1412,7 @@ mod tests {
     /// Unit tests for the variant caller
     use super::*;
     use rust_htslib::faidx;
+    
 
     macro_rules! make_variant_test {
         // Macro to create variant calling tests
