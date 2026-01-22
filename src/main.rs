@@ -679,7 +679,7 @@ fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
 ///
 /// # Returns
 /// A set of candidate VariantObservation instances
-fn get_count_vec_candidates_snps(
+fn get_count_vec_candidates(
     counts: &HashMap<VariantObservation, usize>,
     error_rate: f64,
 ) -> HashSet<VariantObservation> {
@@ -687,96 +687,41 @@ fn get_count_vec_candidates_snps(
     let total_depth = counts.values().sum::<usize>() as u64;
 
     for (variant, &count) in counts.iter() {
+        let mut clears_filters = true;
         match variant {
             VariantObservation::Snp {
                 base,
                 ref_base,
                 deleted_bases: _,
                 insertion_bases: _,
-            } if *base == *ref_base => continue,
-
-            VariantObservation::Snp {
-                base,
-                ref_base: _,
-                deleted_bases: _,
-                insertion_bases: _,
-            } if *base == 'N' => continue,
-
+            } if *base == *ref_base
+                || *base == 'N'
+                || right_tail_binomial_pval(total_depth, count as u64, error_rate) >= 0.05 =>
+            {
+                clears_filters = false;
+            }
             VariantObservation::Insertion {
                 base,
                 ref_base: _,
                 deleted_bases: _,
                 insertion_bases: _,
-            } if *base == 'N' => continue,
+            } if *base == 'N' => {
+                clears_filters = false;
+            }
 
             VariantObservation::Deletion {
                 base,
                 ref_base: _,
                 deleted_bases: _,
                 insertion_bases: _,
-            } if *base == 'N' => continue,
-
+            } if *base == 'N' => {
+                clears_filters = false;
+            }
             _ => {}
         }
-
-        // Calculate p-value for determining if the variant is significant
-        let pval = right_tail_binomial_pval(total_depth, count as u64, error_rate);
-        if pval < 0.05 {
+        if clears_filters {
             candidates.insert(variant.clone());
         }
-    }
-
-    candidates
-}
-
-/// Identify candidate base calls based on statistical significance
-///
-/// # Arguments
-/// * `counts` - A hashmap of VariantObservation to their counts
-/// * `ref_base` - Reference base at the position
-/// * `error_rate` - Expected general error rate
-///
-/// # Returns
-/// A set of candidate VariantObservation instances
-fn get_count_vec_candidates_indels(
-    counts: &HashMap<VariantObservation, usize>,
-) -> HashSet<VariantObservation> {
-    let mut candidates = HashSet::new();
-
-    for (variant, _count) in counts.iter() {
-        match variant {
-            VariantObservation::Snp {
-                base,
-                ref_base,
-                deleted_bases: _,
-                insertion_bases: _,
-            } if *base == *ref_base => continue,
-
-            VariantObservation::Snp {
-                base,
-                ref_base: _,
-                deleted_bases: _,
-                insertion_bases: _,
-            } if *base == 'N' => continue,
-
-            VariantObservation::Insertion {
-                base,
-                ref_base: _,
-                deleted_bases: _,
-                insertion_bases: _,
-            } if *base == 'N' => continue,
-
-            VariantObservation::Deletion {
-                base,
-                ref_base: _,
-                deleted_bases: _,
-                insertion_bases: _,
-            } if *base == 'N' => continue,
-
-            _ => {}
-        }
-
-        candidates.insert(variant.clone());
     }
 
     candidates
@@ -1303,12 +1248,12 @@ fn call_variants(
             b'N'
         };
 
-        let r_one_f_candidates_snps =
-            get_count_vec_candidates_snps(&r_one_f_counts_snps, error_rate);
-        let r_one_r_candidates_snps =
-            get_count_vec_candidates_snps(&r_one_r_counts_snps, error_rate);
-        let r_one_r_candidates_indels = get_count_vec_candidates_indels(&r_one_r_counts_indels);
-        let r_one_f_candidates_indels = get_count_vec_candidates_indels(&r_one_f_counts_indels);
+        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, error_rate);
+        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, error_rate);
+        let r_one_r_candidates_indels =
+            get_count_vec_candidates(&r_one_r_counts_indels, error_rate_indels);
+        let r_one_f_candidates_indels =
+            get_count_vec_candidates(&r_one_f_counts_indels, error_rate_indels);
 
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
@@ -1366,7 +1311,7 @@ fn call_variants(
 
                 let variant = Variant::new(
                     ref_name.to_string(),
-                    pos + 1,
+                    pos + 1, // Convert to 1-based position
                     candidate.get_reference_allele(),
                     candidate.get_alternate_allele(),
                     genotype.genotype,
