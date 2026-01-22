@@ -1014,20 +1014,17 @@ fn extract_pileup_counts(
             if (record.is_reverse() && is_stranded_read_status)
                 || (!record.is_reverse() && !is_stranded_read_status)
             {
-                counts.rev.insert(
-                    obs.clone(),
-                    counts.rev.get(&obs).unwrap_or(&0) + 1,
-                );
+                counts
+                    .rev
+                    .insert(obs.clone(), counts.rev.get(&obs).unwrap_or(&0) + 1);
             } else {
-                counts.fwd.insert(
-                    obs.clone(),
-                    counts.fwd.get(&obs).unwrap_or(&0) + 1,
-                );
+                counts
+                    .fwd
+                    .insert(obs.clone(), counts.fwd.get(&obs).unwrap_or(&0) + 1);
             }
-            counts.total.insert(
-                obs.clone(),
-                counts.total.get(&obs).unwrap_or(&0) + 1,
-            );
+            counts
+                .total
+                .insert(obs.clone(), counts.total.get(&obs).unwrap_or(&0) + 1);
 
             if base_call.is_not_indel() && base_call.base == base_call.ref_base {
                 let read_seq = record.seq().as_bytes();
