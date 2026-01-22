@@ -681,7 +681,6 @@ fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
 /// A set of candidate VariantObservation instances
 fn get_count_vec_candidates_snps(
     counts: &HashMap<VariantObservation, usize>,
-    _ref_base: char,
     error_rate: f64,
 ) -> HashSet<VariantObservation> {
     let mut candidates = HashSet::new();
@@ -741,7 +740,6 @@ fn get_count_vec_candidates_snps(
 /// A set of candidate VariantObservation instances
 fn get_count_vec_candidates_indels(
     counts: &HashMap<VariantObservation, usize>,
-    _ref_base: char,
 ) -> HashSet<VariantObservation> {
     let mut candidates = HashSet::new();
 
@@ -1306,13 +1304,11 @@ fn call_variants(
         };
 
         let r_one_f_candidates_snps =
-            get_count_vec_candidates_snps(&r_one_f_counts_snps, ref_base as char, error_rate);
+            get_count_vec_candidates_snps(&r_one_f_counts_snps, error_rate);
         let r_one_r_candidates_snps =
-            get_count_vec_candidates_snps(&r_one_r_counts_snps, ref_base as char, error_rate);
-        let r_one_r_candidates_indels =
-            get_count_vec_candidates_indels(&r_one_r_counts_indels, ref_base as char);
-        let r_one_f_candidates_indels =
-            get_count_vec_candidates_indels(&r_one_f_counts_indels, ref_base as char);
+            get_count_vec_candidates_snps(&r_one_r_counts_snps, error_rate);
+        let r_one_r_candidates_indels = get_count_vec_candidates_indels(&r_one_r_counts_indels);
+        let r_one_f_candidates_indels = get_count_vec_candidates_indels(&r_one_f_counts_indels);
 
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
