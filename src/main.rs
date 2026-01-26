@@ -1075,6 +1075,32 @@ pub fn workflow(
     Ok(())
 }
 
+/// Distributes counts from a pileup map into SNP and INDEL maps
+///
+/// # Arguments
+/// * `pileup_map` - The pileup counts map
+/// * `snp_map` - The SNP counts map to populate
+/// * `indel_map` - The INDEL counts map to populate
+fn distribute_counts(
+    pileup_map: &std::collections::HashMap<BaseCall, usize>,
+    snp_map: &mut std::collections::HashMap<BaseCall, usize>,
+    indel_map: &mut std::collections::HashMap<BaseCall, usize>,
+) {
+    for (obs, count) in pileup_map {
+        match obs.check_variant_type() {
+            VariantObservation::Snp | VariantObservation::Ref => {
+                snp_map.insert(obs.clone(), *count);
+            }
+            VariantObservation::Insertion | VariantObservation::Deletion => {
+                indel_map.insert(obs.clone(), *count);
+            }
+            VariantObservation::Complex => {
+                continue;
+            }
+        }
+    }
+}
+
 /// Call variants in a given genome chunk
 ///
 /// # Arguments
@@ -1124,32 +1150,6 @@ fn call_variants(
         rev: HashMap::with_capacity(8),
         total: HashMap::with_capacity(8),
     };
-
-    /// Distributes counts from a pileup map into SNP and INDEL maps
-    ///
-    /// # Arguments
-    /// * `pileup_map` - The pileup counts map
-    /// * `snp_map` - The SNP counts map to populate
-    /// * `indel_map` - The INDEL counts map to populate
-    fn distribute_counts(
-        pileup_map: &std::collections::HashMap<BaseCall, usize>,
-        snp_map: &mut std::collections::HashMap<BaseCall, usize>,
-        indel_map: &mut std::collections::HashMap<BaseCall, usize>,
-    ) {
-        for (obs, count) in pileup_map {
-            match obs.check_variant_type() {
-                VariantObservation::Snp | VariantObservation::Ref => {
-                    snp_map.insert(obs.clone(), *count);
-                }
-                VariantObservation::Insertion | VariantObservation::Deletion => {
-                    indel_map.insert(obs.clone(), *count);
-                }
-                VariantObservation::Complex => {
-                    continue;
-                }
-            }
-        }
-    }
 
     let mut r_one_f_counts_snps = HashMap::with_capacity(4);
     let mut r_one_r_counts_snps = HashMap::with_capacity(4);
