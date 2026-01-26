@@ -766,10 +766,17 @@ fn has_repeat(sequence: &[u8], n: usize, cutoff: usize) -> bool {
 
 /// Returns true if the read should be filtered out for INDEL calling
 /// Filters reads with repeated sequences at the ends or soft-clipping
-fn filter_indels(sequence: &[u8], record: &bam::Record, unanchored_repeat_read_end_limit: usize) -> bool {
+fn filter_indels(
+    sequence: &[u8],
+    record: &bam::Record,
+    unanchored_repeat_read_end_limit: usize,
+) -> bool {
     let homopolymer = has_repeat(sequence, 1, unanchored_repeat_read_end_limit);
     let dinuc = has_repeat(sequence, 2, 4);
-    let soft_clipped = record.cigar().iter().any(|op| matches!(op, bam::record::Cigar::SoftClip(_)));
+    let soft_clipped = record
+        .cigar()
+        .iter()
+        .any(|op| matches!(op, Cigar::SoftClip(_)));
 
     homopolymer || dinuc || soft_clipped
 }
