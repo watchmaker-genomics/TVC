@@ -30,3 +30,9 @@ ref_ot_chr11_8195526_G_A_het.bam filter=lfs diff=lfs merge=lfs -text
 chr11:5888900-5889100_long_ins_homo.bam filter=lfs diff=lfs merge=lfs -text
 denovo_ot_chr11_134479860_A_G_homo.bam filter=lfs diff=lfs merge=lfs -text
 ref_ob_chr11_134610622_C_T_homo.bam filter=lfs diff=lfs merge=lfs -text
+chr11:871770-871880_long_ins_homo.bam.bai filter=lfs diff=lfs merge=lfs -text
+chr11:1912250-chr11:1912350_short_del_het.bam filter=lfs diff=lfs merge=lfs -text
+chr11:1912250-chr11:1912350_short_del_het.bam.bai filter=lfs diff=lfs merge=lfs -text
+chr11:2097050-2097150_long_ins_het.bam filter=lfs diff=lfs merge=lfs -text
+chr11:2097050-2097150_long_ins_het.bam.bai filter=lfs diff=lfs merge=lfs -text
+chr11:871770-871880_long_ins_homo.bam filter=lfs diff=lfs merge=lfs -text
