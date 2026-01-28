@@ -1539,6 +1539,40 @@ mod tests {
         (ReadNumber::R1)
     );
 
+    // This test tests a call where an indel is a long and homozygous insertion, and has a low AF
+    make_variant_test!(
+        test_long_ins_homo_af_is_low,
+        "chr11:871770-871880_long_ins_homo.bam",
+        871826,
+        "C",
+        "CGGT",
+        "1/1",
+        (ReadNumber::R1)
+    );
+
+    // This test tests a call where an indel is a long and heterozygous insertion, and AF is high
+    make_variant_test!(
+        test_long_ins_het_af_is_high,
+        "chr11:2097050-2097150_long_ins_het.bam",
+        2097108,
+        "C",
+        "CGCTCTGAG",
+        "0/1",
+        (ReadNumber::R1)
+    );
+
+    // This test tests a call where an indel is a short and heterozygous deletion, and AF is high
+    make_variant_test!(
+        test_short_del_het_af_is_high,
+        "chr11:1912250-chr11:1912350_short_del_het.bam",
+        1912288,
+        "CT",
+        "C",
+        "0/1",
+        (ReadNumber::R1)
+    );
+
+
     // This test tests a call where there was a denovo CpG created and is heterozygous where OT is expected to be non-methylated
     make_variant_test!(
         test_denovo_ot_chr11_134749303_a_g_het,
