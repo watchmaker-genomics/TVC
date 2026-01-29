@@ -818,10 +818,22 @@ fn has_repeat(sequence: &[u8], n: usize, cutoff: usize) -> bool {
 
 /// Returns true if the read should be filtered out for INDEL calling
 /// Filters reads with repeated sequences at the ends or soft-clipping
-fn filter_indels(sequence: &[u8], record: &bam::Record, indel_filter_repeat_limit: usize, dinuc_cutoff: usize) -> bool {
+fn filter_indels(
+    sequence: &[u8],
+    record: &bam::Record,
+    indel_filter_repeat_limit: usize,
+    dinuc_cutoff: usize,
+) -> bool {
     let homopolymer = has_repeat(sequence, 1, indel_filter_repeat_limit);
     let dinuc = has_repeat(sequence, 2, dinuc_cutoff);
-    let soft_clipped = record.cigar().iter().any(|op| matches!(op, bam::record::Cigar::SoftClip(_)));
+    let soft_clipped = {
+        for cigar in record.cigar().iter() {
+            if let Cigar::SoftClip(_) = cigar {
+                return true;
+            }
+        }
+        false
+    };
     homopolymer || dinuc || soft_clipped
 }
 
@@ -1165,7 +1177,7 @@ fn call_variants(
         if depth < min_depth {
             continue;
         }
-        let dinuc_cutoff = if indel_filter_repeat_limit % 2 != 0 {
+        let dinuc_cutoff = if !indel_filter_repeat_limit.is_multiple_of(2) {
             indel_filter_repeat_limit + 1
         } else {
             indel_filter_repeat_limit
