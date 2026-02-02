@@ -1226,8 +1226,8 @@ fn call_variants(
 
         let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, error_rate);
         let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, error_rate);
-        let r_one_r_candidates_indels = get_count_vec_candidates(&r_one_r_counts_indels, 0.05);
-        let r_one_f_candidates_indels = get_count_vec_candidates(&r_one_f_counts_indels, 0.05);
+        let r_one_r_candidates_indels = get_count_vec_candidates(&r_one_r_counts_indels, error_rate);
+        let r_one_f_candidates_indels = get_count_vec_candidates(&r_one_f_counts_indels, error_rate);
 
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
