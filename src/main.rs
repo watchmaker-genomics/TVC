@@ -832,6 +832,30 @@ fn filter_indels(
     homopolymer || dinuc || soft_clipped
 }
 
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TrinucleotideContext {
+    upstream_base: u8,
+    variant_base: u8,
+    downstream_base: u8,
+}
+
+impl TrinucleotideContext {
+    fn new(
+        upstream_base: u8,
+        variant_base: u8,
+        downstream_base: u8,
+) -> Self {
+    TrinucleotideContext {
+        upstream_base,
+        variant_base,
+        downstream_base,
+    }
+}
+}
+
+
+
 /// Compute base call counts from a pileup
 ///
 /// # Arguments
@@ -859,6 +883,7 @@ fn compute_pileup_counts(
     pileup_counts: &mut PileupCounts,
     indel_filter_repeat_limit: usize,
     dinuc_cutoff: usize,
+    mut tnc_error_rate: Option<&mut HashMap<TrinucleotideContext, (f64, f64)>>,  
 ) -> u64 {
     pileup_counts.fwd.clear();
     pileup_counts.rev.clear();
@@ -899,7 +924,41 @@ fn compute_pileup_counts(
             let variant_type = basecall.check_variant_type();
 
             let read_len = record.seq().len();
+            if let Some(rates) = tnc_error_rate.as_mut() {
+                let left_flank = if ref_pos > 0 {
+                    ref_seq[(ref_pos - 1) as usize]  
+                } else {
+                    b'N'
+                };
 
+                let right_flank = if (ref_pos as usize + 1) < ref_seq.len() {
+                    ref_seq[(ref_pos + 1) as usize] 
+                } else {
+                    b'N' 
+                };
+
+                let trinucleotide_context = TrinucleotideContext::new(
+                    left_flank,
+                    base as u8,
+                    right_flank,
+                );
+
+                // Now use 'rates' directly (it's the unwrapped HashMap)
+                rates
+                    .entry(trinucleotide_context)
+                    .and_modify(|(alt, ref_count)| {
+                        if variant_type == VariantObservation::Snp {
+                            *alt += 1.0;
+                        } else if variant_type == VariantObservation::Ref {
+                            *ref_count += 1.0;
+                        }
+                    })
+                    .or_insert(if variant_type == VariantObservation::Snp { 
+                        (1.0, 0.0) 
+                    } else { 
+                        (0.0, 1.0) 
+                    });
+            }
             if variant_type == VariantObservation::Snp {
                 if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
                     continue;
@@ -1099,6 +1158,105 @@ fn distribute_counts(
     }
 }
 
+fn compute_tnc_error_rates(
+    chunk: &GenomeChunk,
+    bam_path: &str,
+    ref_seq: &[u8],
+    min_bq: usize,
+    min_mapq: usize,
+    min_depth: u32,
+    end_of_read_cutoff: usize,
+    indel_end_of_read_cutoff: usize,
+    max_mismatches: u32,
+    min_ao: u32,
+    error_rate: f64,
+    stranded_read: &ReadNumber,
+    indel_filter_repeat_limit: usize,
+) -> Result<HashMap<TrinucleotideContext, f64>, Box<dyn std::error::Error>> {
+    // Initialize all possible trinucleotide contexts with (alt_count, ref_count)
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut tnc_counts = HashMap::new();
+    
+    for &upstream in &bases {
+        for &ref_base in &bases {
+            for &variant_base in &bases {
+                for &downstream in &bases {
+                    let context = TrinucleotideContext::new(
+                        upstream,
+                        variant_base,
+                        downstream,
+                    );
+                    tnc_counts.insert(context, (0.0, 0.0));
+                }
+            }
+        }
+    }
+    
+    let mut bam = bam::IndexedReader::from_path(bam_path).expect("Error opening BAM file");
+
+    let header = bam.header().to_owned();
+    let tid = header
+        .tid(chunk.contig.as_bytes())
+        .ok_or("Contig not found in BAM header")?;
+
+    bam.fetch((tid, chunk.start as i64, chunk.end as i64))?;
+
+    let mut pileup_counts = PileupCounts {
+        fwd: HashMap::with_capacity(8),
+        rev: HashMap::with_capacity(8),
+        total: HashMap::with_capacity(8),
+    };
+
+    // First pass: collect raw counts
+    for result in bam.pileup() {
+        let pileup: Pileup = result.expect("Failed to read pileup");
+        
+        let pos = pileup.pos(); // 0-based
+        let depth = pileup.depth();
+        
+        if depth < min_depth {
+            continue;
+        }
+        
+        let dinuc_cutoff = if !indel_filter_repeat_limit.is_multiple_of(2) {
+            indel_filter_repeat_limit + 1
+        } else {
+            indel_filter_repeat_limit
+        };
+
+        compute_pileup_counts(
+            &pileup,
+            min_bq,
+            min_mapq,
+            end_of_read_cutoff,
+            indel_end_of_read_cutoff,
+            max_mismatches,
+            ref_seq,
+            pos,
+            stranded_read,
+            &mut pileup_counts,
+            indel_filter_repeat_limit,
+            dinuc_cutoff,
+            Some(&mut tnc_counts),  // Pass the counts map to be populated
+        );
+    }
+    
+    // Second pass: convert counts to allele frequencies
+    let mut tnc_error_rates = HashMap::new();
+    for (context, (alt_count, ref_count)) in tnc_counts {
+        let total = alt_count + ref_count;
+        // Calculate AF: alt / (alt + ref), handle division by zero
+        let af = if total > 0.0 {
+            alt_count / total
+        } else {
+            0.0
+        };
+        tnc_error_rates.insert(context, af);
+    }
+    
+    Ok(tnc_error_rates)
+}
+
 /// Call variants in a given genome chunk
 ///
 /// # Arguments
@@ -1157,6 +1315,23 @@ fn call_variants(
     let mut total_counts_snps = HashMap::with_capacity(4);
     let mut total_counts_indels = HashMap::with_capacity(4);
 
+    let error_rates = compute_tnc_error_rates(
+        chunk,
+        bam_path,
+        ref_seq,
+        min_bq,
+        min_mapq,
+        min_depth,
+        end_of_read_cutoff,
+        indel_end_of_read_cutoff,
+        max_mismatches,
+        min_ao,
+        error_rate,
+        stranded_read,
+            indel_filter_repeat_limit,
+        );
+    println!("error_rates {:?}", error_rates);
+
     for result in bam.pileup() {
         let pileup: Pileup = result.expect("Failed to read pileup");
         let tid = pileup.tid();
@@ -1188,6 +1363,7 @@ fn call_variants(
             &mut pileup_counts,
             indel_filter_repeat_limit,
             dinuc_cutoff,
+            None,
         );
 
         r_one_f_counts_snps.clear();
