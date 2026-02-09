@@ -364,6 +364,14 @@ impl BaseCall {
             panic!("Unexpected variant observed");
         }
     }
+    /// Get the trinucleotide context for the base call
+    fn get_trinucleotide_context(&self, upstream_base: char, downstream_base: char) -> TrinucleotideContext {
+        TrinucleotideContext::new(
+            upstream_base as u8,
+            self.base as u8,
+            downstream_base as u8,
+        )
+    }
 
     /// Get the reference allele string
     ///
@@ -943,7 +951,6 @@ fn compute_pileup_counts(
                     right_flank,
                 );
 
-                // Now use 'rates' directly (it's the unwrapped HashMap)
                 rates
                     .entry(trinucleotide_context)
                     .and_modify(|(alt, ref_count)| {
@@ -1173,7 +1180,6 @@ fn compute_tnc_error_rates(
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
 ) -> Result<HashMap<TrinucleotideContext, f64>, Box<dyn std::error::Error>> {
-    // Initialize all possible trinucleotide contexts with (alt_count, ref_count)
     let bases = [b'A', b'C', b'G', b'T'];
     let mut tnc_counts = HashMap::new();
     
@@ -1237,21 +1243,19 @@ fn compute_tnc_error_rates(
             &mut pileup_counts,
             indel_filter_repeat_limit,
             dinuc_cutoff,
-            Some(&mut tnc_counts),  // Pass the counts map to be populated
+            Some(&mut tnc_counts),
         );
     }
     
-    // Second pass: convert counts to allele frequencies
     let mut tnc_error_rates = HashMap::new();
     for (context, (alt_count, ref_count)) in tnc_counts {
         let total = alt_count + ref_count;
-        // Calculate AF: alt / (alt + ref), handle division by zero
-        let af = if total > 0.0 {
+        let er = if total > 0.0 && 0.0 < alt_count / total && alt_count / total < 0.01 {
             alt_count / total
-        } else {
-            0.0
+        } else { // handle division by zero or cases with no observed variants
+            error_rate
         };
-        tnc_error_rates.insert(context, af);
+        tnc_error_rates.insert(context, er);
     }
     
     Ok(tnc_error_rates)
@@ -1330,7 +1334,7 @@ fn call_variants(
         stranded_read,
             indel_filter_repeat_limit,
         );
-    println!("error_rates {:?}", error_rates);
+    let error_map = error_rates?;
 
     for result in bam.pileup() {
         let pileup: Pileup = result.expect("Failed to read pileup");
@@ -1400,12 +1404,19 @@ fn call_variants(
             b'N'
         };
 
-        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, error_rate);
-        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, error_rate);
+        let trinucleotidecontext = TrinucleotideContext::new(upstream_base, ref_base, downstream_base);
+        let tnc_error_rate = error_map
+            .get(&trinucleotidecontext)
+            .cloned()
+            .unwrap_or(0.01); // default to 1% if context not found
+        println!("Position {}: TNC {:?} has error rate {}", pos + 1, trinucleotidecontext, tnc_error_rate);
+
+        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, tnc_error_rate);
+        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, tnc_error_rate);
         let r_one_r_candidates_indels =
-            get_count_vec_candidates(&r_one_r_counts_indels, error_rate);
+            get_count_vec_candidates(&r_one_r_counts_indels, tnc_error_rate);
         let r_one_f_candidates_indels =
-            get_count_vec_candidates(&r_one_f_counts_indels, error_rate);
+            get_count_vec_candidates(&r_one_f_counts_indels, tnc_error_rate);
 
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
@@ -1447,7 +1458,7 @@ fn call_variants(
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, total_depth as usize, error_rate);
+                let genotype = assign_genotype(*alt_counts, total_depth as usize, tnc_error_rate);
                 if genotype.genotype == "0/0" {
                     continue;
                 }
