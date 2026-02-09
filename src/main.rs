@@ -89,7 +89,7 @@ struct Args {
     #[arg(short = 'p', long, default_value_t = 0.005)]
     error_rate: f64,
 
-    #[arg(short = 'h', long, default_value_t = 3)]
+    #[arg(short = 'f', long, default_value_t = 3)]
     indel_filter_repeat_limit: usize,
 
     #[arg(short = 'r', long, value_enum, default_value_t = ReadNumber::R1)]
