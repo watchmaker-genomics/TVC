@@ -122,6 +122,7 @@ struct Variant {
     depth: u32,
     alt_counts: u32,
     calling_directive: CallingDirective,
+    is_somatic: bool,
 }
 
 impl Variant {
@@ -137,6 +138,7 @@ impl Variant {
     /// * `depth` - Read depth at the variant position
     /// * `alt_counts` - Count of reads supporting the alternate allele
     /// * `calling_directive` - Calling directive for the variant caller
+    /// * `is_somatic` - Indicates if the variant is somatic
     ///
     /// # Returns
     /// A new Variant instance
@@ -150,6 +152,7 @@ impl Variant {
         depth: u32,
         alt_counts: u32,
         calling_directive: CallingDirective,
+        is_somatic: bool,
     ) -> Self {
         Variant {
             contig,
@@ -161,6 +164,7 @@ impl Variant {
             depth,
             alt_counts,
             calling_directive,
+            is_somatic,
         }
     }
 
@@ -180,6 +184,8 @@ impl Variant {
             "DEL".to_string()
         } else if self.reference.len() == 1 && self.alt.len() > 1 {
             "INS".to_string()
+        } else if self.is_somatic {
+            "SOMATIC".to_string()
         } else {
             "COMPLEX".to_string()
         }
@@ -363,14 +369,6 @@ impl BaseCall {
         } else {
             panic!("Unexpected variant observed");
         }
-    }
-    /// Get the trinucleotide context for the base call
-    fn get_trinucleotide_context(&self, upstream_base: char, downstream_base: char) -> TrinucleotideContext {
-        TrinucleotideContext::new(
-            upstream_base as u8,
-            self.base as u8,
-            downstream_base as u8,
-        )
     }
 
     /// Get the reference allele string
@@ -715,7 +713,7 @@ fn get_count_vec_candidates(
 ///
 /// # Returns
 /// A Genotype instance with assigned genotype and quality score
-fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype {
+fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> (Genotype, bool) {
     let homo_ref_prob = Binomial::new(error_rate, depth as u64)
         .unwrap()
         .pmf(alt_counts as u64);
@@ -735,8 +733,13 @@ fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype
     } else {
         ("1/1", homo_alt_prob)
     };
-
-    Genotype::new(gt, best_prob, total)
+    let af = alt_counts as f64 / depth as f64;
+    let is_somatic = if af > error_rate && af < 0.1 {
+        true
+    } else {
+        false
+    };
+    (Genotype::new(gt, best_prob, total), is_somatic)
 }
 
 /// Retrieve an NM tag from a record
@@ -1249,8 +1252,11 @@ fn compute_tnc_error_rates(
     
     let mut tnc_error_rates = HashMap::new();
     for (context, (alt_count, ref_count)) in tnc_counts {
+        println!("Context: {}{}{}, Alt Count: {}, Ref Count: {}", 
+            context.upstream_base as char, context.variant_base as char, context.downstream_base as char,
+            alt_count, ref_count);
         let total = alt_count + ref_count;
-        let er = if total > 0.0 && 0.0 < alt_count / total && alt_count / total < 0.01 {
+        let er = if total > 0.0 && 0.0 < alt_count / total && alt_count / total < 1.0 {
             alt_count / total
         } else { // handle division by zero or cases with no observed variants
             error_rate
@@ -1408,7 +1414,7 @@ fn call_variants(
         let tnc_error_rate = error_map
             .get(&trinucleotidecontext)
             .cloned()
-            .unwrap_or(0.01); // default to 1% if context not found
+            .unwrap_or(error_rate); 
         println!("Position {}: TNC {:?} has error rate {}", pos + 1, trinucleotidecontext, tnc_error_rate);
 
         let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, tnc_error_rate);
@@ -1458,8 +1464,8 @@ fn call_variants(
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, total_depth as usize, tnc_error_rate);
-                if genotype.genotype == "0/0" {
+                let (genotype, is_somatic) = assign_genotype(*alt_counts, total_depth as usize, tnc_error_rate);
+                if genotype.genotype == "0/0" && !is_somatic {
                     continue;
                 }
 
@@ -1473,6 +1479,7 @@ fn call_variants(
                     total_depth as u32,
                     *alt_counts as u32,
                     directive_snps.clone(),
+                    is_somatic,
                 );
                 variants.push(variant);
             }
@@ -1484,8 +1491,8 @@ fn call_variants(
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, total_depth_filtered as usize, 0.05);
-                if genotype.genotype == "0/0" {
+                let (genotype, is_somatic) = assign_genotype(*alt_counts, total_depth_filtered as usize, 0.05);
+                if genotype.genotype == "0/0" && !is_somatic {
                     continue;
                 }
 
@@ -1499,6 +1506,7 @@ fn call_variants(
                     total_depth_filtered as u32,
                     *alt_counts as u32,
                     directive_indels.clone(),
+                    is_somatic,
                 );
                 variants.push(variant);
             }
