@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use rust_htslib::bam::pileup::Alignment;
 use rust_htslib::bam::pileup::Indel;
 use rust_htslib::bam::pileup::Pileup;
+use rust_htslib::bam::record::Cigar;
 use rust_htslib::bam::{self, Read};
 use rust_htslib::faidx;
 use statrs::distribution::{Binomial, Discrete, DiscreteCDF};
@@ -70,7 +71,7 @@ struct Args {
     #[arg(short = 'e', long, default_value_t = 5)]
     end_of_read_cutoff: usize,
 
-    #[arg(short = 'i', long, default_value_t = 20)]
+    #[arg(short = 'i', long, default_value_t = 0)]
     indel_end_of_read_cutoff: usize,
 
     #[arg(short = 'x', long, default_value_t = 10)]
@@ -87,6 +88,9 @@ struct Args {
 
     #[arg(short = 'p', long, default_value_t = 0.005)]
     error_rate: f64,
+
+    #[arg(short = 'f', long, default_value_t = 3)]
+    indel_filter_repeat_limit: usize,
 
     #[arg(short = 'r', long, value_enum, default_value_t = ReadNumber::R1)]
     stranded_read: ReadNumber,
@@ -202,6 +206,7 @@ impl Variant {
                 CallingDirective::ReferenceSiteOt => "REF_OT",
                 CallingDirective::DenovoSiteOt => "DENOVO_OT",
                 CallingDirective::BothStrands => "BOTH",
+                CallingDirective::Indel => "BOTH",
             },
             self.genotype,
             self.depth,
@@ -265,9 +270,25 @@ enum CallingDirective {
     ReferenceSiteOt,
     DenovoSiteOt,
     BothStrands,
+    Indel,
+}
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+/// Types of variant observations
+///
+/// # Variants
+/// * `Snp` - Single nucleotide polymorphism
+/// * `Insertion` - Insertion variant
+/// * `Deletion` - Deletion variant
+/// * `Ref` - Reference allele
+/// * `Complex` - Complex variant
+enum VariantObservation {
+    Snp,
+    Insertion,
+    Deletion,
+    Ref,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 /// Representation of a base call from a read alignment
 ///
 /// # Fields
@@ -323,6 +344,27 @@ impl BaseCall {
         }
     }
 
+    /// Determine the variant observation type
+    fn check_variant_type(&self) -> VariantObservation {
+        if self.insertion_bases.is_empty()
+            && self.deleted_bases.is_empty()
+            && self.ref_base != self.base
+        {
+            VariantObservation::Snp
+        } else if !self.insertion_bases.is_empty() {
+            VariantObservation::Insertion
+        } else if !self.deleted_bases.is_empty() {
+            VariantObservation::Deletion
+        } else if self.insertion_bases.is_empty()
+            && self.deleted_bases.is_empty()
+            && self.ref_base == self.base
+        {
+            VariantObservation::Ref
+        } else {
+            panic!("Unexpected variant observed");
+        }
+    }
+
     /// Get the reference allele string
     ///
     /// # Returns
@@ -347,13 +389,6 @@ impl BaseCall {
             alt_allele.push_str(&String::from_utf8_lossy(&self.insertion_bases));
         }
         alt_allele
-    }
-
-    /// Check if the BaseCall represents a SNP
-    /// # Returns
-    /// True if SNP, false otherwise
-    fn is_snp(&self) -> bool {
-        self.deleted_bases.is_empty() && self.insertion_bases.is_empty()
     }
 }
 
@@ -493,7 +528,6 @@ fn validate_fai_and_bam(
     }
     Ok(())
 }
-
 /// Determine the calling directive based on reference and alternate bases
 ///
 /// # Arguments
@@ -510,6 +544,15 @@ fn find_where_to_call_variants(
     upstream_base: char,
     downstream_base: char,
 ) -> CallingDirective {
+    if alt_candidates.iter().any(|bc| {
+        matches!(
+            bc.check_variant_type(),
+            VariantObservation::Insertion | VariantObservation::Deletion
+        )
+    }) {
+        return CallingDirective::Indel;
+    }
+
     let alt_candidate_bases: HashSet<char> = alt_candidates.iter().map(|bc| bc.base).collect();
 
     if ref_base == 'C' && downstream_base == 'G' {
@@ -522,6 +565,49 @@ fn find_where_to_call_variants(
         CallingDirective::DenovoSiteOt
     } else {
         CallingDirective::BothStrands
+    }
+}
+/// Select candidates and counts based on calling directive
+///
+/// # Arguments
+/// * `ref_base` - Reference base at the position
+/// * `upstream_base` - Base upstream of the position
+/// * `downstream_base` - Base downstream of the position
+/// * `fwd_candidates` - Set of forward strand base candidates
+/// * `fwd_counts` - Counts of forward strand base calls
+/// * `rev_candidates` - Set of reverse strand base candidates
+/// * `rev_counts` - Counts of reverse strand base calls
+/// * `total_counts` - Total counts of base calls
+/// # Returns
+///
+/// A tuple containing the selected candidates and their counts
+fn select_candidates_and_counts(
+    ref_base: char,
+    upstream_base: char,
+    downstream_base: char,
+    fwd_candidates: &HashSet<BaseCall>,
+    fwd_counts: &HashMap<BaseCall, usize>,
+    rev_candidates: &HashSet<BaseCall>,
+    rev_counts: &HashMap<BaseCall, usize>,
+    total_counts: &HashMap<BaseCall, usize>,
+) -> (HashSet<BaseCall>, HashMap<BaseCall, usize>) {
+    let directive =
+        find_where_to_call_variants(ref_base, fwd_candidates, upstream_base, downstream_base);
+
+    match directive {
+        CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => {
+            (rev_candidates.clone(), rev_counts.clone())
+        }
+        CallingDirective::ReferenceSiteOt | CallingDirective::DenovoSiteOt => {
+            (fwd_candidates.clone(), fwd_counts.clone())
+        }
+        CallingDirective::BothStrands | CallingDirective::Indel => {
+            let intersection: HashSet<BaseCall> = fwd_candidates
+                .intersection(rev_candidates)
+                .cloned()
+                .collect();
+            (intersection, total_counts.clone())
+        }
     }
 }
 
@@ -572,33 +658,43 @@ fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
     let cdf = binom.cdf(k - 1);
     1.0 - cdf
 }
-
-/// Identify candidate base calls based on statistical significance
-///
-/// # Arguments
-/// * `counts` - A hashmap of BaseCall to their counts
-/// * `ref_base` - Reference base at the position
-/// * `error_rate` - Expected general error rate
-///
-/// # Returns
-/// A set of candidate BaseCall instances
 fn get_count_vec_candidates(
     counts: &HashMap<BaseCall, usize>,
-    ref_base: char,
     error_rate: f64,
 ) -> HashSet<BaseCall> {
     let mut candidates = HashSet::new();
-
     let total_depth = counts.values().sum::<usize>() as u64;
+
     for (basecall, &count) in counts.iter() {
-        if (basecall.base == ref_base && basecall.is_snp()) || basecall.base == 'N' {
-            continue;
+        let mut clears_filters = true;
+        let variant = basecall.check_variant_type();
+        match variant {
+            VariantObservation::Snp
+                if basecall.base == 'N'
+                    || basecall.base == basecall.ref_base
+                    || right_tail_binomial_pval(total_depth, count as u64, error_rate) >= 0.05 =>
+            {
+                clears_filters = false;
+            }
+
+            VariantObservation::Insertion | VariantObservation::Deletion
+                if basecall.base == 'N' =>
+            {
+                clears_filters = false;
+            }
+
+            VariantObservation::Ref => {
+                clears_filters = false;
+            }
+
+            _ => {}
         }
-        let pval = right_tail_binomial_pval(total_depth, count as u64, error_rate);
-        if pval < 0.05 {
+
+        if clears_filters {
             candidates.insert(basecall.clone());
         }
     }
+
     candidates
 }
 
@@ -671,7 +767,72 @@ fn is_stranded_read(record: &bam::Record, stranded_read: &ReadNumber) -> bool {
     read_orientation == *stranded_read
 }
 
-/// Extract base call counts from a pileup
+#[derive(Debug)]
+/// Counts of basecalls in a pileup
+struct PileupCounts {
+    fwd: HashMap<BaseCall, usize>,
+    rev: HashMap<BaseCall, usize>,
+    total: HashMap<BaseCall, usize>,
+}
+/// Returns true if a slice has a repeated pattern of length n
+/// at the start or end, with at least cutoff bases.
+fn has_repeat(sequence: &[u8], n: usize, cutoff: usize) -> bool {
+    let len = sequence.len();
+    if len < cutoff || n == 0 {
+        return false;
+    }
+    // Check start
+    if len >= cutoff {
+        let mut start_ok = true;
+        for i in (0..cutoff).step_by(n) {
+            if sequence[i..i + n] != sequence[0..n] {
+                start_ok = false;
+                break;
+            }
+        }
+        if start_ok {
+            return true;
+        }
+    }
+
+    // Check end
+    if len >= cutoff {
+        let mut end_ok = true;
+        for i in (len - cutoff..len).step_by(n) {
+            if sequence[i..i + n] != sequence[len - n..len] {
+                end_ok = false;
+                break;
+            }
+        }
+        if end_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if the read should be filtered out for INDEL calling
+/// Filters reads with repeated sequences at the ends or soft-clipping
+fn filter_indels(
+    sequence: &[u8],
+    record: &bam::Record,
+    indel_filter_repeat_limit: usize,
+    dinuc_cutoff: usize,
+) -> bool {
+    let homopolymer = has_repeat(sequence, 1, indel_filter_repeat_limit);
+    let dinuc = has_repeat(sequence, 2, dinuc_cutoff);
+    let soft_clipped = {
+        for cigar in record.cigar().iter() {
+            if let Cigar::SoftClip(_) = cigar {
+                return true;
+            }
+        }
+        false
+    };
+    homopolymer || dinuc || soft_clipped
+}
+
+/// Compute base call counts from a pileup
 ///
 /// # Arguments
 /// * `pileup` - The pileup to extract counts from
@@ -684,8 +845,8 @@ fn is_stranded_read(record: &bam::Record, stranded_read: &ReadNumber) -> bool {
 /// * `ref_pos` - The reference position
 ///
 /// # Returns
-/// A tuple of three hashmaps: (R1 forward counts, R1 reverse counts, total counts)
-fn extract_pileup_counts(
+/// A Counts instance with extracted counts
+fn compute_pileup_counts(
     pileup: &Pileup,
     min_bq: usize,
     min_mapq: usize,
@@ -695,15 +856,14 @@ fn extract_pileup_counts(
     ref_seq: &[u8],
     ref_pos: u32,
     stranded_read: &ReadNumber,
-) -> (
-    HashMap<BaseCall, usize>,
-    HashMap<BaseCall, usize>,
-    HashMap<BaseCall, usize>,
-) {
-    let mut r_one_f_counts = HashMap::new();
-    let mut r_one_r_counts = HashMap::new();
-
-    let mut total_counts = HashMap::new();
+    pileup_counts: &mut PileupCounts,
+    indel_filter_repeat_limit: usize,
+    dinuc_cutoff: usize,
+) -> u64 {
+    pileup_counts.fwd.clear();
+    pileup_counts.rev.clear();
+    pileup_counts.total.clear();
+    let mut indel_offset = 0;
 
     for alignment in pileup.alignments() {
         let record = alignment.record();
@@ -716,16 +876,13 @@ fn extract_pileup_counts(
             let base = record.seq().as_bytes()[qpos] as char;
             let qual = record.qual()[qpos];
             let mapq = record.mapq();
-            let is_del = alignment.is_del();
-            let is_refskip = alignment.is_refskip();
 
-            if is_del || is_refskip {
+            if alignment.is_del() || alignment.is_refskip() {
                 continue;
             }
             if base == 'N' {
                 continue;
             }
-
             if qual < min_bq as u8 {
                 continue;
             }
@@ -737,10 +894,13 @@ fn extract_pileup_counts(
                 continue;
             }
 
-            let base_call = BaseCall::new(&alignment, ref_seq, ref_pos);
+            let basecall = BaseCall::new(&alignment, ref_seq, ref_pos);
+
+            let variant_type = basecall.check_variant_type();
 
             let read_len = record.seq().len();
-            if base_call.is_snp() {
+
+            if variant_type == VariantObservation::Snp {
                 if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
                     continue;
                 }
@@ -750,28 +910,37 @@ fn extract_pileup_counts(
             }
 
             let is_stranded_read_status = is_stranded_read(&record, stranded_read);
-
             if (record.is_reverse() && is_stranded_read_status)
                 || (!record.is_reverse() && !is_stranded_read_status)
             {
-                r_one_r_counts.insert(
-                    base_call.clone(),
-                    r_one_r_counts.get(&base_call).unwrap_or(&0) + 1,
-                );
+                pileup_counts
+                    .rev
+                    .entry(basecall.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
             } else {
-                r_one_f_counts.insert(
-                    base_call.clone(),
-                    r_one_f_counts.get(&base_call).unwrap_or(&0) + 1,
-                );
+                pileup_counts
+                    .fwd
+                    .entry(basecall.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
             }
-            total_counts.insert(
-                base_call.clone(),
-                total_counts.get(&base_call).unwrap_or(&0) + 1,
-            );
+            pileup_counts
+                .total
+                .entry(basecall.clone())
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+
+            if variant_type == VariantObservation::Ref {
+                let read_seq = record.seq().as_bytes();
+                if filter_indels(&read_seq, &record, indel_filter_repeat_limit, dinuc_cutoff) {
+                    indel_offset += 1;
+                }
+            }
         }
     }
 
-    (r_one_f_counts, r_one_r_counts, total_counts)
+    indel_offset
 }
 
 /// Main workflow for variant calling
@@ -808,6 +977,7 @@ pub fn workflow(
     chunk_size: u64,
     error_rate: f64,
     stranded_read: &ReadNumber,
+    indel_filter_repeat_limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TVC workflow");
     validate_fai_and_bam(ref_path, bam_path)?;
@@ -874,6 +1044,7 @@ pub fn workflow(
                     min_ao,
                     error_rate,
                     stranded_read,
+                    indel_filter_repeat_limit,
                 )
                 .unwrap_or_else(|_e| Vec::new());
                 open_files_counter.fetch_sub(1, Ordering::SeqCst);
@@ -903,6 +1074,29 @@ pub fn workflow(
     }
 
     Ok(())
+}
+
+/// Distributes counts from a pileup map into SNP and INDEL maps
+///
+/// # Arguments
+/// * `pileup_map` - The pileup counts map
+/// * `snp_map` - The SNP counts map to populate
+/// * `indel_map` - The INDEL counts map to populate
+fn distribute_counts(
+    pileup_map: &std::collections::HashMap<BaseCall, usize>,
+    snp_map: &mut std::collections::HashMap<BaseCall, usize>,
+    indel_map: &mut std::collections::HashMap<BaseCall, usize>,
+) {
+    for (obs, count) in pileup_map {
+        match obs.check_variant_type() {
+            VariantObservation::Snp | VariantObservation::Ref => {
+                snp_map.insert(obs.clone(), *count);
+            }
+            VariantObservation::Insertion | VariantObservation::Deletion => {
+                indel_map.insert(obs.clone(), *count);
+            }
+        }
+    }
 }
 
 /// Call variants in a given genome chunk
@@ -935,10 +1129,8 @@ fn call_variants(
     min_ao: u32,
     error_rate: f64,
     stranded_read: &ReadNumber,
+    indel_filter_repeat_limit: usize,
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
-    // Placeholder for the workflow function
-    // This is where the main logic of your variant caller would go
-
     let mut bam = bam::IndexedReader::from_path(bam_path).expect("Error opening BAM file");
 
     let header = bam.header().to_owned();
@@ -950,6 +1142,20 @@ fn call_variants(
     bam.fetch((tid, chunk.start as i64, chunk.end as i64))?;
 
     let mut variants = Vec::new();
+
+    let mut pileup_counts = PileupCounts {
+        fwd: HashMap::with_capacity(8),
+        rev: HashMap::with_capacity(8),
+        total: HashMap::with_capacity(8),
+    };
+
+    let mut r_one_f_counts_snps = HashMap::with_capacity(4);
+    let mut r_one_r_counts_snps = HashMap::with_capacity(4);
+    let mut r_one_f_counts_indels = HashMap::with_capacity(4);
+    let mut r_one_r_counts_indels = HashMap::with_capacity(4);
+
+    let mut total_counts_snps = HashMap::with_capacity(4);
+    let mut total_counts_indels = HashMap::with_capacity(4);
 
     for result in bam.pileup() {
         let pileup: Pileup = result.expect("Failed to read pileup");
@@ -963,8 +1169,13 @@ fn call_variants(
         if depth < min_depth {
             continue;
         }
+        let dinuc_cutoff = if !indel_filter_repeat_limit.is_multiple_of(2) {
+            indel_filter_repeat_limit + 1
+        } else {
+            indel_filter_repeat_limit
+        };
 
-        let (r_one_f_counts, r_one_r_counts, total_counts) = extract_pileup_counts(
+        let indel_offset = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -974,11 +1185,33 @@ fn call_variants(
             ref_seq,
             pos,
             stranded_read,
+            &mut pileup_counts,
+            indel_filter_repeat_limit,
+            dinuc_cutoff,
         );
 
-        let mut all_found_alts: HashSet<&BaseCall> = HashSet::new();
-        all_found_alts.extend(r_one_f_counts.keys());
-        all_found_alts.extend(r_one_r_counts.keys());
+        r_one_f_counts_snps.clear();
+        r_one_r_counts_snps.clear();
+        r_one_f_counts_indels.clear();
+        r_one_r_counts_indels.clear();
+        total_counts_snps.clear();
+        total_counts_indels.clear();
+
+        distribute_counts(
+            &pileup_counts.fwd,
+            &mut r_one_f_counts_snps,
+            &mut r_one_f_counts_indels,
+        );
+        distribute_counts(
+            &pileup_counts.rev,
+            &mut r_one_r_counts_snps,
+            &mut r_one_r_counts_indels,
+        );
+        distribute_counts(
+            &pileup_counts.total,
+            &mut total_counts_snps,
+            &mut total_counts_indels,
+        );
 
         let upstream_base = if pos > 0 {
             ref_seq[pos as usize - 1]
@@ -991,42 +1224,50 @@ fn call_variants(
             b'N'
         };
 
-        let r_one_f_candidates =
-            get_count_vec_candidates(&r_one_f_counts, ref_base as char, error_rate);
-        let r_one_r_candidates =
-            get_count_vec_candidates(&r_one_r_counts, ref_base as char, error_rate);
+        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, error_rate);
+        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, error_rate);
+        let r_one_r_candidates_indels =
+            get_count_vec_candidates(&r_one_r_counts_indels, error_rate);
+        let r_one_f_candidates_indels =
+            get_count_vec_candidates(&r_one_f_counts_indels, error_rate);
 
-        let directive = find_where_to_call_variants(
+        let directive_snps = find_where_to_call_variants(
             ref_base as char,
-            &r_one_f_candidates,
+            &r_one_f_candidates_snps,
             upstream_base as char,
             downstream_base as char,
         );
 
-        let (candidates, counts): (HashSet<BaseCall>, HashMap<BaseCall, usize>) = match directive {
-            CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => {
-                (r_one_r_candidates.clone(), r_one_r_counts.clone())
-            }
-            CallingDirective::ReferenceSiteOt | CallingDirective::DenovoSiteOt => {
-                (r_one_f_candidates.clone(), r_one_f_counts.clone())
-            }
-            CallingDirective::BothStrands => (
-                r_one_f_candidates
-                    .intersection(&r_one_r_candidates)
-                    .cloned()
-                    .collect(),
-                total_counts.clone(),
-            ),
-        };
+        let (candidate_snps, counts_snps) = select_candidates_and_counts(
+            ref_base as char,
+            upstream_base as char,
+            downstream_base as char,
+            &r_one_f_candidates_snps,
+            &r_one_f_counts_snps,
+            &r_one_r_candidates_snps,
+            &r_one_r_counts_snps,
+            &total_counts_snps,
+        );
 
-        let total_depth = counts.values().sum::<usize>() as u64;
-        if total_depth < min_depth as u64 {
-            continue;
-        }
+        let (candidate_indels, counts_indels) = select_candidates_and_counts(
+            ref_base as char,
+            upstream_base as char,
+            downstream_base as char,
+            &r_one_f_candidates_indels,
+            &r_one_f_counts_indels,
+            &r_one_r_candidates_indels,
+            &r_one_r_counts_indels,
+            &total_counts_indels,
+        );
 
-        if !candidates.is_empty() {
-            for candidate in candidates {
-                let alt_counts = counts.get(&candidate).unwrap_or(&0);
+        let total_depth_snps = counts_snps.values().sum::<usize>() as u64;
+        let total_depth_indels = counts_indels.values().sum::<usize>() as u64;
+        let total_depth = total_depth_snps + total_depth_indels;
+        let total_depth_filtered = total_depth.saturating_sub(indel_offset);
+        let directive_indels = CallingDirective::BothStrands;
+        if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
+            for candidate in candidate_snps {
+                let alt_counts = counts_snps.get(&candidate).unwrap_or(&0);
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
@@ -1037,14 +1278,40 @@ fn call_variants(
 
                 let variant = Variant::new(
                     ref_name.to_string(),
-                    pos + 1, // Convert to 1-based position
+                    pos + 1, // convert to 1-based position
                     candidate.get_reference_allele(),
                     candidate.get_alternate_allele(),
                     genotype.genotype,
                     genotype.score,
                     total_depth as u32,
                     *alt_counts as u32,
-                    directive.clone(),
+                    directive_snps.clone(),
+                );
+                variants.push(variant);
+            }
+        }
+
+        if !candidate_indels.is_empty() && total_depth_indels >= min_depth as u64 {
+            for candidate in candidate_indels {
+                let alt_counts = counts_indels.get(&candidate).unwrap_or(&0);
+                if *alt_counts < min_ao as usize {
+                    continue;
+                }
+                let genotype = assign_genotype(*alt_counts, total_depth_filtered as usize, 0.05);
+                if genotype.genotype == "0/0" {
+                    continue;
+                }
+
+                let variant = Variant::new(
+                    ref_name.to_string(),
+                    pos + 1, // convert to 1-based position
+                    candidate.get_reference_allele(),
+                    candidate.get_alternate_allele(),
+                    genotype.genotype,
+                    genotype.score,
+                    total_depth_filtered as u32,
+                    *alt_counts as u32,
+                    directive_indels.clone(),
                 );
                 variants.push(variant);
             }
@@ -1069,6 +1336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk_size = args.chunk_size;
     let error_rate = args.error_rate;
     let stranded_read = &args.stranded_read;
+    let indel_filter_repeat_limit = args.indel_filter_repeat_limit;
 
     let level = args.log_level.as_str(); // use the enum value from clap
 
@@ -1092,6 +1360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chunk_size,
         error_rate,
         stranded_read,
+        indel_filter_repeat_limit,
     )?;
 
     Ok(())
@@ -1149,8 +1418,13 @@ mod tests {
                     1,     // min_ao
                     0.005, // error_rate
                     &$stranded_read,
+                    3, // indel_filter_repeat_limit
                 )
                 .expect("call_variants failed");
+
+                if variants.is_empty() {
+                    println!("Warning: No variants called");
+                }
 
                 let matching_variant = variants
                     .iter()
@@ -1206,6 +1480,50 @@ mod tests {
         "T",
         "C",
         "0/1",
+        (ReadNumber::R1)
+    );
+
+    // This test tests a call where an indel is a short and heterozygous deletion
+    make_variant_test!(
+        test_short_hetero_del,
+        "chr11:1160400-1160500_short_hetero_del.bam",
+        1160456,
+        "AC",
+        "A",
+        "0/1",
+        (ReadNumber::R1)
+    );
+
+    // This test tests a call where an indel is a long and heterozygous insertion
+    make_variant_test!(
+        test_long_ins_hetero,
+        "chr11:228150-228350_long_ins_hetero.bam",
+        228244,
+        "C",
+        "CA",
+        "0/1",
+        (ReadNumber::R1)
+    );
+
+    // This test tests a call where an indel is a short and homozygous insertion
+    make_variant_test!(
+        test_short_insertion_homo,
+        "chr11:6586900-6587100_short_ins_homo.bam",
+        6586999,
+        "T",
+        "TG",
+        "1/1",
+        (ReadNumber::R1)
+    );
+
+    // This test tests a call where an indel is a long and homozygous insertion
+    make_variant_test!(
+        test_long_ins_homo,
+        "chr11:5888900-5889100_long_ins_homo.bam",
+        5889008,
+        "C",
+        "CTAGAG",
+        "1/1",
         (ReadNumber::R1)
     );
 
@@ -1308,6 +1626,7 @@ mod tests {
             1,               // min_ao
             0.005,           // error_rate
             &ReadNumber::R1, // stranded_read
+            3,               // indel_filter_repeat_limit
         )
         .expect("call_variants failed");
 
@@ -1358,6 +1677,7 @@ mod tests {
             1,               // min_ao
             0.005,           // error_rate
             &ReadNumber::R1, // stranded_read
+            3,               // indel_filter_repeat_limit
         )
         .expect("call_variants failed");
 
@@ -1378,10 +1698,7 @@ mod tests {
         let test_ref = "test_assets/chr11.fasta";
         let test_bam = "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam";
         // Load reference
-        let ref_reader = faidx::Reader::from_path(test_ref).expect(
-            "Failed to
-    open FASTA",
-        );
+        let ref_reader = faidx::Reader::from_path(test_ref).expect("Failed to open FASTA");
         let contig = "chr11";
         let seq_len = ref_reader.fetch_seq_len(contig);
         let ref_seq: Vec<u8> = ref_reader
@@ -1406,6 +1723,7 @@ mod tests {
             1,               // min_ao
             0.005,           // error_rate
             &ReadNumber::R2, // stranded_read
+            3,               // indel_filter_repeat_limit
         )
         .expect("call_variants failed");
         let filtered_variants: Vec<&Variant> = variants
@@ -1419,4 +1737,134 @@ mod tests {
             filtered_variants.len()
         );
     }
+}
+
+#[cfg(test)]
+struct Qualities(Vec<u8>);
+
+#[cfg(test)]
+impl Qualities {
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        Qualities(bytes)
+    }
+}
+
+#[test]
+fn test_homopolymer_read_start() {
+    // Tests the indel filtering function for homopolymers at the start of reads
+    let mut record_with_homopolymer = bam::Record::new();
+    let cigar = bam::record::CigarString::from(vec![Cigar::Match(7)]);
+    let qname = b"simulated_read";
+    let seq = b"AAATGCC";
+    let quals = Qualities::from_bytes(vec![255; 7]);
+    let qual: Vec<u8> = quals.0;
+    record_with_homopolymer.set(qname, Some(&cigar), seq, &qual);
+    assert!(filter_indels(seq, &record_with_homopolymer, 3, 4));
+
+    let mut record_without_homopolymer = bam::Record::new();
+    let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(7)]);
+
+    let qname2 = b"simulated_read";
+    let seq2 = b"AATGCC";
+    let quals2 = Qualities::from_bytes(vec![255; 6]);
+    let qual2: Vec<u8> = quals2.0;
+    record_without_homopolymer.set(qname2, Some(&cigar2), seq2, &qual2);
+
+    assert!(filter_indels(seq, &record_with_homopolymer, 3, 4));
+    assert!(!filter_indels(seq2, &record_without_homopolymer, 3, 4));
+}
+
+#[test]
+fn test_homopolymer_read_end() {
+    // Tests the indel filtering function for homopolymers at the end of reads
+    let mut record_with_homopolymer = bam::Record::new();
+    let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+    let qname = b"simulated_read";
+    let seq = b"GCCTTT";
+    let quals = Qualities::from_bytes(vec![255; 6]);
+    let qual: Vec<u8> = quals.0;
+    record_with_homopolymer.set(qname, Some(&cigar), seq, &qual);
+    assert!(filter_indels(seq, &record_with_homopolymer, 3, 4));
+
+    let mut record_without_homopolymer = bam::Record::new();
+    let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+
+    let qname2 = b"simulated_read";
+    let seq2 = b"GCCTT";
+    let quals2 = Qualities::from_bytes(vec![255; 5]);
+    let qual2: Vec<u8> = quals2.0;
+    record_without_homopolymer.set(qname2, Some(&cigar2), seq2, &qual2);
+
+    assert!(filter_indels(seq, &record_with_homopolymer, 3, 4));
+    assert!(!filter_indels(seq2, &record_without_homopolymer, 3, 4));
+}
+
+#[test]
+fn test_dinucleotide_read_start() {
+    // Tests the indel filtering function for dinucleotides at the start of reads
+    let mut record_with_dinucleotide = bam::Record::new();
+    let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+    let qname = b"simulated_read";
+    let seq = b"ATATGC";
+    let quals = Qualities::from_bytes(vec![255; 6]);
+    let qual: Vec<u8> = quals.0;
+    record_with_dinucleotide.set(qname, Some(&cigar), seq, &qual);
+    assert!(filter_indels(seq, &record_with_dinucleotide, 3, 4));
+    let mut record_without_dinucleotide = bam::Record::new();
+    let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+
+    let qname2 = b"simulated_read";
+    let seq2 = b"ATCGTG";
+    let quals2 = Qualities::from_bytes(vec![255; 6]);
+    let qual2: Vec<u8> = quals2.0;
+    record_without_dinucleotide.set(qname2, Some(&cigar2), seq2, &qual2);
+
+    assert!(filter_indels(seq, &record_with_dinucleotide, 3, 4));
+    assert!(!filter_indels(seq2, &record_without_dinucleotide, 3, 4));
+}
+
+#[test]
+fn test_dinucleotide_read_end() {
+    // Tests the indel filtering function for dinucleotides at the end of reads
+    let mut record_with_dinucleotide = bam::Record::new();
+    let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+    let qname = b"simulated_read";
+    let seq = b"GCCTTT";
+    let quals = Qualities::from_bytes(vec![255; 6]);
+    let qual: Vec<u8> = quals.0;
+    record_with_dinucleotide.set(qname, Some(&cigar), seq, &qual);
+    assert!(filter_indels(seq, &record_with_dinucleotide, 3, 4));
+    let mut record_without_dinucleotide = bam::Record::new();
+    let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+
+    let qname2 = b"simulated_read";
+    let seq2 = b"GCCTTG";
+    let quals2 = Qualities::from_bytes(vec![255; 6]);
+    let qual2: Vec<u8> = quals2.0;
+    record_without_dinucleotide.set(qname2, Some(&cigar2), seq2, &qual2);
+
+    assert!(filter_indels(seq, &record_with_dinucleotide, 3, 4));
+    assert!(!filter_indels(seq2, &record_without_dinucleotide, 3, 4));
+}
+
+#[test]
+fn test_check_soft_clip() {
+    // Tests the indel filtering function for soft-clipped reads
+    let mut record = bam::Record::new();
+    let cigar_with_soft_clip = bam::record::CigarString::from(vec![
+        Cigar::SoftClip(5),
+        Cigar::Match(10),
+        Cigar::SoftClip(3),
+    ]);
+    let qname = b"simulated_read";
+    let seq = b"ACGTACGTAC";
+    let quals = Qualities::from_bytes(vec![255; 10]);
+    let qual: Vec<u8> = quals.0;
+    record.set(qname, Some(&cigar_with_soft_clip), seq, &qual);
+    assert!(filter_indels(seq, &record, 3, 4));
+
+    let mut record_no_soft_clip = bam::Record::new();
+    let cigar_no_soft_clip = bam::record::CigarString::from(vec![Cigar::Match(10)]);
+    record_no_soft_clip.set(qname, Some(&cigar_no_soft_clip), seq, &qual);
+    assert!(!filter_indels(seq, &record_no_soft_clip, 3, 4));
 }
