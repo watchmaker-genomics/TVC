@@ -669,7 +669,6 @@ fn get_count_vec_candidates(
     error_rate: f64,
 ) -> HashSet<BaseCall> {
     let mut candidates = HashSet::new();
-    let total_depth = counts.values().sum::<usize>() as u64;
 
     for (basecall, &count) in counts.iter() {
         let mut clears_filters = true;
@@ -677,8 +676,7 @@ fn get_count_vec_candidates(
         match variant {
             VariantObservation::Snp
                 if basecall.base == 'N'
-                    || basecall.base == basecall.ref_base
-                    || right_tail_binomial_pval(total_depth, count as u64, error_rate) >= 0.05 =>
+                    || basecall.base == basecall.ref_base =>
             {
                 clears_filters = false;
             }
@@ -734,11 +732,12 @@ fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> (Genotyp
         ("1/1", homo_alt_prob)
     };
     let af = alt_counts as f64 / depth as f64;
-    let is_somatic = if af > error_rate && af < 0.1 {
+    let is_somatic = if af > error_rate && af < 0.3 {
         true
     } else {
         false
     };
+    println!("genotype is {}, error_rate is {}, is_somatic is {}", gt, error_rate, is_somatic);
     (Genotype::new(gt, best_prob, total), is_somatic)
 }
 
@@ -847,19 +846,19 @@ fn filter_indels(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TrinucleotideContext {
     upstream_base: u8,
-    variant_base: u8,
+    ref_base: u8,
     downstream_base: u8,
 }
 
 impl TrinucleotideContext {
     fn new(
         upstream_base: u8,
-        variant_base: u8,
+        ref_base: u8,
         downstream_base: u8,
 ) -> Self {
     TrinucleotideContext {
         upstream_base,
-        variant_base,
+        ref_base,
         downstream_base,
     }
 }
@@ -950,7 +949,7 @@ fn compute_pileup_counts(
 
                 let trinucleotide_context = TrinucleotideContext::new(
                     left_flank,
-                    base as u8,
+                    ref_seq[ref_pos as usize] as u8,
                     right_flank,
                 );
 
@@ -1190,9 +1189,9 @@ fn compute_tnc_error_rates(
         for &ref_base in &bases {
             for &variant_base in &bases {
                 for &downstream in &bases {
-                    let context = TrinucleotideContext::new(
+                    let context: TrinucleotideContext = TrinucleotideContext::new(
                         upstream,
-                        variant_base,
+                        ref_base,
                         downstream,
                     );
                     tnc_counts.insert(context, (0.0, 0.0));
@@ -1252,9 +1251,6 @@ fn compute_tnc_error_rates(
     
     let mut tnc_error_rates = HashMap::new();
     for (context, (alt_count, ref_count)) in tnc_counts {
-        println!("Context: {}{}{}, Alt Count: {}, Ref Count: {}", 
-            context.upstream_base as char, context.variant_base as char, context.downstream_base as char,
-            alt_count, ref_count);
         let total = alt_count + ref_count;
         let er = if total > 0.0 && 0.0 < alt_count / total && alt_count / total < 1.0 {
             alt_count / total
@@ -1410,12 +1406,11 @@ fn call_variants(
             b'N'
         };
 
-        let trinucleotidecontext = TrinucleotideContext::new(upstream_base, ref_base, downstream_base);
+        let trinucleotidecontext = TrinucleotideContext::new(upstream_base, ref_base as u8, downstream_base);
         let tnc_error_rate = error_map
             .get(&trinucleotidecontext)
             .cloned()
             .unwrap_or(error_rate); 
-        println!("Position {}: TNC {:?} has error rate {}", pos + 1, trinucleotidecontext, tnc_error_rate);
 
         let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, tnc_error_rate);
         let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, tnc_error_rate);
@@ -1785,6 +1780,17 @@ mod tests {
         "G",
         "A",
         "0/1",
+        (ReadNumber::R1)
+    );
+
+    // Test a low af somatic variant
+    make_variant_test!(
+        test_somatic_variant,
+        "chr1_1556825-1556885.bam",
+        1556855,
+        "G",
+        "A",
+        "0/0",
         (ReadNumber::R1)
     );
 
