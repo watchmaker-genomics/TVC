@@ -669,6 +669,7 @@ fn get_count_vec_candidates(
     error_rate: f64,
 ) -> HashSet<BaseCall> {
     let mut candidates = HashSet::new();
+    let total_depth = counts.values().sum::<usize>() as u64;
 
     for (basecall, &count) in counts.iter() {
         let mut clears_filters = true;
@@ -676,7 +677,8 @@ fn get_count_vec_candidates(
         match variant {
             VariantObservation::Snp
                 if basecall.base == 'N'
-                    || basecall.base == basecall.ref_base =>
+                    || basecall.base == basecall.ref_base 
+                    || right_tail_binomial_pval(total_depth, count as u64, error_rate) >= 0.05 =>
             {
                 clears_filters = false;
             }
