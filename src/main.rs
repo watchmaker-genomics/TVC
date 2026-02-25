@@ -737,7 +737,6 @@ fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> (Genotyp
     } else {
         false
     };
-    println!("genotype is {}, error_rate is {}, is_somatic is {}", gt, error_rate, is_somatic);
     (Genotype::new(gt, best_prob, total), is_somatic)
 }
 
@@ -1187,15 +1186,13 @@ fn compute_tnc_error_rates(
     
     for &upstream in &bases {
         for &ref_base in &bases {
-            for &variant_base in &bases {
-                for &downstream in &bases {
-                    let context: TrinucleotideContext = TrinucleotideContext::new(
-                        upstream,
-                        ref_base,
-                        downstream,
-                    );
-                    tnc_counts.insert(context, (0.0, 0.0));
-                }
+            for &downstream in &bases {
+                let context: TrinucleotideContext = TrinucleotideContext::new(
+                    upstream,
+                    ref_base,
+                    downstream,
+                );
+            tnc_counts.insert(context, (0.0, 0.0));
             }
         }
     }
@@ -1214,12 +1211,18 @@ fn compute_tnc_error_rates(
         rev: HashMap::with_capacity(8),
         total: HashMap::with_capacity(8),
     };
-
+    let mut r_one_f_counts_snps = HashMap::with_capacity(4);
+    let mut r_one_r_counts_snps = HashMap::with_capacity(4);
+    let mut r_one_f_counts_indels = HashMap::with_capacity(4);
+    let mut r_one_r_counts_indels = HashMap::with_capacity(4);
+    let mut total_counts_snps = HashMap::with_capacity(4);
+    let mut total_counts_indels = HashMap::with_capacity(4);
     // First pass: collect raw counts
     for result in bam.pileup() {
         let pileup: Pileup = result.expect("Failed to read pileup");
         
         let pos = pileup.pos(); // 0-based
+        let ref_base = ref_seq[pos as usize];
         let depth = pileup.depth();
         
         if depth < min_depth {
@@ -1247,9 +1250,71 @@ fn compute_tnc_error_rates(
             dinuc_cutoff,
             Some(&mut tnc_counts),
         );
+
+        r_one_f_counts_snps.clear();
+        r_one_r_counts_snps.clear();
+        r_one_f_counts_indels.clear();
+        r_one_r_counts_indels.clear();
+        total_counts_snps.clear();
+        total_counts_indels.clear();
+
+        distribute_counts(
+            &pileup_counts.fwd,
+            &mut r_one_f_counts_snps,
+            &mut r_one_f_counts_indels,
+        );
+        distribute_counts(
+            &pileup_counts.rev,
+            &mut r_one_r_counts_snps,
+            &mut r_one_r_counts_indels,
+        );
+        distribute_counts(
+            &pileup_counts.total,
+            &mut total_counts_snps,
+            &mut total_counts_indels,
+        );
+
+        let upstream_base = if pos > 0 {
+            ref_seq[pos as usize - 1]
+        } else {
+            b'N'
+        };
+        let downstream_base = if pos < ref_seq.len() as u32 - 1 {
+            ref_seq[pos as usize + 1]
+        } else {
+            b'N'
+        };
+
+        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, error_rate);
+        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, error_rate);
+        let r_one_r_candidates_indels =
+            get_count_vec_candidates(&r_one_r_counts_indels, error_rate);
+        let r_one_f_candidates_indels =
+            get_count_vec_candidates(&r_one_f_counts_indels, error_rate);
+        let trinucleotidecontext = TrinucleotideContext::new(upstream_base, ref_base as u8, downstream_base);
+        let (candidate_snps, counts_snps) = select_candidates_and_counts(
+            ref_base as char,
+            upstream_base as char,
+            downstream_base as char,
+            &r_one_f_candidates_snps,
+            &r_one_f_counts_snps,
+            &r_one_r_candidates_snps,
+            &r_one_r_counts_snps,
+            &total_counts_snps,
+        );
+        let total_counts_snps: u64 = counts_snps.values().sum::<usize>() as u64;
+        let af = total_counts_snps as f64 / depth as f64;
+        if af > 0.2 {
+            tnc_counts
+                .entry(trinucleotidecontext.clone())
+                .and_modify(|(alt, ref_count)| {
+                    *alt -= total_counts_snps as f64;
+                    *ref_count -= (depth - total_counts_snps as u32) as f64;
+                });
+        }
     }
     
-    let mut tnc_error_rates = HashMap::new();
+    let mut tnc_error_rates: HashMap<TrinucleotideContext, f64> = HashMap::new();
     for (context, (alt_count, ref_count)) in tnc_counts {
         let total = alt_count + ref_count;
         let er = if total > 0.0 && 0.0 < alt_count / total && alt_count / total < 1.0 {
