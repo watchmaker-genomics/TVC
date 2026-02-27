@@ -674,6 +674,7 @@ fn get_count_vec_candidates(
     for (basecall, &count) in counts.iter() {
         let mut clears_filters = true;
         let variant = basecall.check_variant_type();
+        let af = total_depth / count as u64;
         match variant {
             VariantObservation::Snp
                 if basecall.base == 'N'
@@ -1306,16 +1307,17 @@ fn compute_tnc_error_rates(
         );
         let total_counts_snps: u64 = counts_snps.values().sum::<usize>() as u64;
         let af = total_counts_snps as f64 / depth as f64;
-        if af > 0.2 {
+        if af <= 0.2 {
+            // Accumulate low-AF positions to estimate background error
             tnc_counts
                 .entry(trinucleotidecontext.clone())
                 .and_modify(|(alt, ref_count)| {
-                    *alt -= total_counts_snps as f64;
-                    *ref_count -= (depth - total_counts_snps as u32) as f64;
-                });
-        }
+                    *alt += total_counts_snps as f64;       // ADD, not subtract
+                    *ref_count += (depth - total_counts_snps as u32) as f64;
+                })
+                .or_insert((total_counts_snps as f64, (depth - total_counts_snps as u32) as f64));
+        } 
     }
-    
     let mut tnc_error_rates: HashMap<TrinucleotideContext, f64> = HashMap::new();
     for (context, (alt_count, ref_count)) in tnc_counts {
         let total = alt_count + ref_count;
