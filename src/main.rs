@@ -123,6 +123,7 @@ struct Variant {
     alt_counts: u32,
     calling_directive: CallingDirective,
     is_somatic: bool,
+    error_rate: f64,
 }
 
 impl Variant {
@@ -153,6 +154,7 @@ impl Variant {
         alt_counts: u32,
         calling_directive: CallingDirective,
         is_somatic: bool,
+        error_rate: f64,
     ) -> Self {
         Variant {
             contig,
@@ -165,6 +167,7 @@ impl Variant {
             alt_counts,
             calling_directive,
             is_somatic,
+            error_rate,
         }
     }
 
@@ -184,8 +187,6 @@ impl Variant {
             "DEL".to_string()
         } else if self.reference.len() == 1 && self.alt.len() > 1 {
             "INS".to_string()
-        } else if self.is_somatic {
-            "SOMATIC".to_string()
         } else {
             "COMPLEX".to_string()
         }
@@ -199,12 +200,13 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO\t{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\t{}\tVT={};CD={}\tGT:DP:AO:ER\t{}:{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
             self.alt,
             self.score.round(),
+            self.is_somatic.then(|| "SOMATIC").unwrap_or("GERMLINE"),
             variant_type,
             match self.calling_directive {
                 CallingDirective::ReferenceSiteOb => "REF_OB",
@@ -217,6 +219,7 @@ impl Variant {
             self.genotype,
             self.depth,
             self.alt_counts,
+            self.error_rate,
         )
     }
 }
@@ -740,6 +743,7 @@ fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> (Genotyp
     } else {
         false
     };
+    println!("Assigned genotype: {:?}, Somatic: {}", gt, is_somatic);
     (Genotype::new(gt, best_prob, total), is_somatic)
 }
 
@@ -1406,6 +1410,7 @@ fn call_variants(
             indel_filter_repeat_limit,
         );
     let error_map = error_rates?;
+    println!("Computed TNC error rates for chunk {}: {:?}", chunk.contig, error_map);
 
     for result in bam.pileup() {
         let pileup: Pileup = result.expect("Failed to read pileup");
@@ -1544,6 +1549,7 @@ fn call_variants(
                     *alt_counts as u32,
                     directive_snps.clone(),
                     is_somatic,
+                    tnc_error_rate,
                 );
                 variants.push(variant);
             }
@@ -1571,6 +1577,7 @@ fn call_variants(
                     *alt_counts as u32,
                     directive_indels.clone(),
                     is_somatic,
+                    tnc_error_rate,
                 );
                 variants.push(variant);
             }
