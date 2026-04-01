@@ -124,6 +124,7 @@ struct Variant {
     calling_directive: CallingDirective,
     is_somatic: bool,
     error_rate: f64,
+    tnc: TrinucleotideContext,
 }
 
 impl Variant {
@@ -155,6 +156,7 @@ impl Variant {
         calling_directive: CallingDirective,
         is_somatic: bool,
         error_rate: f64,
+        tnc: TrinucleotideContext,
     ) -> Self {
         Variant {
             contig,
@@ -168,6 +170,7 @@ impl Variant {
             calling_directive,
             is_somatic,
             error_rate,
+            tnc,
         }
     }
 
@@ -200,7 +203,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\t{}\tVT={};CD={}\tGT:DP:AO:ER\t{}:{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\t{}\tVT={};CD={}\tGT:DP:AO:ER:TNC\t{}:{}:{}:{}:{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -220,6 +223,9 @@ impl Variant {
             self.depth,
             self.alt_counts,
             self.error_rate,
+            self.tnc.upstream_base as char,
+            self.tnc.ref_base as char,
+            self.tnc.downstream_base as char,
         )
     }
 }
@@ -648,6 +654,8 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n\
 ##FORMAT=<ID=RO,Number=1,Type=Integer,Description=\"Reference Allele Count\">\n\
 ##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n\
+##FORMAT=<ID=ER,Number=1,Type=Float,Description=\"Estimated Error Rate\">\n\
+##FORMAT=<ID=TNC,Number=3,Type=String,Description=\"Trinucleotide Context (upstream,ref,downstream)\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
         contigs
     )
@@ -743,7 +751,6 @@ fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> (Genotyp
     } else {
         false
     };
-    println!("Assigned genotype: {:?}, Somatic: {}", gt, is_somatic);
     (Genotype::new(gt, best_prob, total), is_somatic)
 }
 
@@ -1410,7 +1417,6 @@ fn call_variants(
             indel_filter_repeat_limit,
         );
     let error_map = error_rates?;
-    println!("Computed TNC error rates for chunk {}: {:?}", chunk.contig, error_map);
 
     for result in bam.pileup() {
         let pileup: Pileup = result.expect("Failed to read pileup");
@@ -1550,6 +1556,7 @@ fn call_variants(
                     directive_snps.clone(),
                     is_somatic,
                     tnc_error_rate,
+                    trinucleotidecontext.clone(),
                 );
                 variants.push(variant);
             }
@@ -1578,6 +1585,7 @@ fn call_variants(
                     directive_indels.clone(),
                     is_somatic,
                     tnc_error_rate,
+                    trinucleotidecontext.clone(),
                 );
                 variants.push(variant);
             }
