@@ -203,13 +203,12 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\t{}\tVT={};CD={}\tGT:DP:AO:ER:TNC\t{}:{}:{}:{}:{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC\t{}:{}:{}:{}:{}{}{}\n",
             self.contig,
             self.pos,
             self.reference,
             self.alt,
             self.score.round(),
-            self.is_somatic.then(|| "SOMATIC").unwrap_or("GERMLINE"),
             variant_type,
             match self.calling_directive {
                 CallingDirective::ReferenceSiteOb => "REF_OB",
