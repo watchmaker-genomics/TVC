@@ -97,6 +97,9 @@ struct Args {
 
     #[arg(short = 'l', long, value_enum, default_value_t = LogLevel::Info)]
     log_level: LogLevel,
+
+    #[arg(short = 'k', long, default_value_t = 0.05)]
+    right_tail_pval: f64,
 }
 
 /// Representation of a genomic variant
@@ -125,6 +128,7 @@ struct Variant {
     is_somatic: bool,
     error_rate: f64,
     tnc: TrinucleotideContext,
+    right_tail_pval: f64,
 }
 
 impl Variant {
@@ -157,6 +161,7 @@ impl Variant {
         is_somatic: bool,
         error_rate: f64,
         tnc: TrinucleotideContext,
+        right_tail_pval: f64,
     ) -> Self {
         Variant {
             contig,
@@ -171,6 +176,7 @@ impl Variant {
             is_somatic,
             error_rate,
             tnc,
+            right_tail_pval,
         }
     }
 
@@ -666,6 +672,7 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 /// * `n` - Number of trials
 /// * `k` - Number of successes
 /// * `p` - Probability of success on each trial
+/// * `right_tail_pval` - Threshold for right-tail p-value
 ///
 /// # Returns
 /// Right-tail p-value
@@ -677,6 +684,7 @@ fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
 fn get_count_vec_candidates(
     counts: &HashMap<BaseCall, usize>,
     error_rate: f64,
+    right_tail_pval: f64,
 ) -> HashSet<BaseCall> {
     let mut candidates = HashSet::new();
     let total_depth = counts.values().sum::<usize>() as u64;
@@ -689,7 +697,7 @@ fn get_count_vec_candidates(
             VariantObservation::Snp
                 if basecall.base == 'N'
                     || basecall.base == basecall.ref_base 
-                    || right_tail_binomial_pval(total_depth, count as u64, error_rate) >= 0.05 =>
+                    || right_tail_binomial_pval(total_depth, count as u64, error_rate) >= right_tail_pval =>
             {
                 clears_filters = false;
             }
@@ -1058,6 +1066,7 @@ pub fn workflow(
     error_rate: f64,
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
+    right_tail_pval: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TVC workflow");
     validate_fai_and_bam(ref_path, bam_path)?;
@@ -1125,6 +1134,7 @@ pub fn workflow(
                     error_rate,
                     stranded_read,
                     indel_filter_repeat_limit,
+                    right_tail_pval,
                 )
                 .unwrap_or_else(|_e| Vec::new());
                 open_files_counter.fetch_sub(1, Ordering::SeqCst);
@@ -1193,6 +1203,7 @@ fn compute_tnc_error_rates(
     error_rate: f64,
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
+    right_tail_pval: f64,
 ) -> Result<HashMap<TrinucleotideContext, f64>, Box<dyn std::error::Error>> {
     let bases = [b'A', b'C', b'G', b'T'];
     let mut tnc_counts = HashMap::new();
@@ -1298,12 +1309,12 @@ fn compute_tnc_error_rates(
             b'N'
         };
 
-        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, error_rate);
-        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, error_rate);
+        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, error_rate, right_tail_pval);
+        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, error_rate, right_tail_pval);
         let r_one_r_candidates_indels =
-            get_count_vec_candidates(&r_one_r_counts_indels, error_rate);
+            get_count_vec_candidates(&r_one_r_counts_indels, error_rate, right_tail_pval);
         let r_one_f_candidates_indels =
-            get_count_vec_candidates(&r_one_f_counts_indels, error_rate);
+            get_count_vec_candidates(&r_one_f_counts_indels, error_rate, right_tail_pval);
         let trinucleotidecontext = TrinucleotideContext::new(upstream_base, ref_base as u8, downstream_base);
         let (candidate_snps, counts_snps) = select_candidates_and_counts(
             ref_base as char,
@@ -1373,6 +1384,7 @@ fn call_variants(
     error_rate: f64,
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
+    right_tail_pval: f64,
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
     let mut bam = bam::IndexedReader::from_path(bam_path).expect("Error opening BAM file");
 
@@ -1413,7 +1425,8 @@ fn call_variants(
         min_ao,
         error_rate,
         stranded_read,
-            indel_filter_repeat_limit,
+        indel_filter_repeat_limit,
+        right_tail_pval,
         );
     let error_map = error_rates?;
 
@@ -1491,12 +1504,12 @@ fn call_variants(
             .cloned()
             .unwrap_or(error_rate); 
 
-        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, tnc_error_rate);
-        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, tnc_error_rate);
+        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, tnc_error_rate, right_tail_pval);
+        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, tnc_error_rate, right_tail_pval);
         let r_one_r_candidates_indels =
-            get_count_vec_candidates(&r_one_r_counts_indels, tnc_error_rate);
+            get_count_vec_candidates(&r_one_r_counts_indels, tnc_error_rate, right_tail_pval);
         let r_one_f_candidates_indels =
-            get_count_vec_candidates(&r_one_f_counts_indels, tnc_error_rate);
+            get_count_vec_candidates(&r_one_f_counts_indels, tnc_error_rate, right_tail_pval);
 
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
@@ -1556,6 +1569,7 @@ fn call_variants(
                     is_somatic,
                     tnc_error_rate,
                     trinucleotidecontext.clone(),
+                    right_tail_pval,
                 );
                 variants.push(variant);
             }
@@ -1585,6 +1599,7 @@ fn call_variants(
                     is_somatic,
                     tnc_error_rate,
                     trinucleotidecontext.clone(),
+                    right_tail_pval,
                 );
                 variants.push(variant);
             }
@@ -1610,6 +1625,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let error_rate = args.error_rate;
     let stranded_read = &args.stranded_read;
     let indel_filter_repeat_limit = args.indel_filter_repeat_limit;
+    let right_tail_pval = args.right_tail_pval;
 
     let level = args.log_level.as_str(); // use the enum value from clap
 
@@ -1634,6 +1650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         error_rate,
         stranded_read,
         indel_filter_repeat_limit,
+        right_tail_pval,
     )?;
 
     Ok(())
@@ -1692,6 +1709,7 @@ mod tests {
                     0.005, // error_rate
                     &$stranded_read,
                     3, // indel_filter_repeat_limit
+                    0.05, // right_tail_pval
                 )
                 .expect("call_variants failed");
 
@@ -1911,6 +1929,7 @@ mod tests {
             0.005,           // error_rate
             &ReadNumber::R1, // stranded_read
             3,               // indel_filter_repeat_limit
+            0.05,            // right_tail_pval
         )
         .expect("call_variants failed");
 
@@ -1962,6 +1981,7 @@ mod tests {
             0.005,           // error_rate
             &ReadNumber::R1, // stranded_read
             3,               // indel_filter_repeat_limit
+            0.05,            // right_tail_pval
         )
         .expect("call_variants failed");
 
@@ -2008,6 +2028,7 @@ mod tests {
             0.005,           // error_rate
             &ReadNumber::R2, // stranded_read
             3,               // indel_filter_repeat_limit
+            0.05,              // right_tail_pval
         )
         .expect("call_variants failed");
         let filtered_variants: Vec<&Variant> = variants
