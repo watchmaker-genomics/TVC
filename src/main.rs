@@ -692,7 +692,6 @@ fn get_count_vec_candidates(
     for (basecall, &count) in counts.iter() {
         let mut clears_filters = true;
         let variant = basecall.check_variant_type();
-        let af = total_depth / count as u64;
         match variant {
             VariantObservation::Snp
                 if basecall.base == 'N'
@@ -973,6 +972,14 @@ fn compute_pileup_counts(
                     right_flank,
                 );
 
+            if variant_type == VariantObservation::Snp {
+                if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
+                    continue;
+                }
+            } else if qpos < indel_end_of_read_cutoff || qpos >= read_len - indel_end_of_read_cutoff
+            {
+                continue;
+            }
                 rates
                     .entry(trinucleotide_context)
                     .and_modify(|(alt, ref_count)| {
@@ -988,15 +995,6 @@ fn compute_pileup_counts(
                         (0.0, 1.0) 
                     });
             }
-            if variant_type == VariantObservation::Snp {
-                if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
-                    continue;
-                }
-            } else if qpos < indel_end_of_read_cutoff || qpos >= read_len - indel_end_of_read_cutoff
-            {
-                continue;
-            }
-
             let is_stranded_read_status = is_stranded_read(&record, stranded_read);
             if (record.is_reverse() && is_stranded_read_status)
                 || (!record.is_reverse() && !is_stranded_read_status)
@@ -1328,13 +1326,13 @@ fn compute_tnc_error_rates(
         );
         let total_counts_snps: u64 = counts_snps.values().sum::<usize>() as u64;
         let af = total_counts_snps as f64 / depth as f64;
-        if af <= 0.2 {
+        if af >= 0.2 {
             // Accumulate low-AF positions to estimate background error
             tnc_counts
                 .entry(trinucleotidecontext.clone())
                 .and_modify(|(alt, ref_count)| {
-                    *alt += total_counts_snps as f64;       // ADD, not subtract
-                    *ref_count += (depth - total_counts_snps as u32) as f64;
+                    *alt -= total_counts_snps as f64; // subtract high-AF SNPs
+                    *ref_count -= (depth - total_counts_snps as u32) as f64; // subtract high-AF reference counts
                 })
                 .or_insert((total_counts_snps as f64, (depth - total_counts_snps as u32) as f64));
         } 
