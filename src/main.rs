@@ -695,8 +695,8 @@ fn get_count_vec_candidates(
         match variant {
             VariantObservation::Snp
                 if basecall.base == 'N'
-                    || basecall.base == basecall.ref_base 
-                    || right_tail_binomial_pval(total_depth, count as u64, error_rate) >= right_tail_pval =>
+                    || basecall.base == basecall.ref_base =>
+                    // || right_tail_binomial_pval(total_depth, count as u64, error_rate) >= right_tail_pval =>
             {
                 clears_filters = false;
             }
@@ -953,17 +953,18 @@ fn compute_pileup_counts(
             let variant_type = basecall.check_variant_type();
 
             let read_len = record.seq().len();
+
             if let Some(rates) = tnc_error_rate.as_mut() {
                 let left_flank = if ref_pos > 0 {
-                    ref_seq[(ref_pos - 1) as usize]  
+                    ref_seq[(ref_pos - 1) as usize]
                 } else {
                     b'N'
                 };
 
                 let right_flank = if (ref_pos as usize + 1) < ref_seq.len() {
-                    ref_seq[(ref_pos + 1) as usize] 
+                    ref_seq[(ref_pos + 1) as usize]
                 } else {
-                    b'N' 
+                    b'N'
                 };
 
                 let trinucleotide_context = TrinucleotideContext::new(
@@ -972,14 +973,6 @@ fn compute_pileup_counts(
                     right_flank,
                 );
 
-            if variant_type == VariantObservation::Snp {
-                if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
-                    continue;
-                }
-            } else if qpos < indel_end_of_read_cutoff || qpos >= read_len - indel_end_of_read_cutoff
-            {
-                continue;
-            }
                 rates
                     .entry(trinucleotide_context)
                     .and_modify(|(alt, ref_count)| {
@@ -989,11 +982,20 @@ fn compute_pileup_counts(
                             *ref_count += 1.0;
                         }
                     })
-                    .or_insert(if variant_type == VariantObservation::Snp { 
-                        (1.0, 0.0) 
-                    } else { 
-                        (0.0, 1.0) 
+                    .or_insert(if variant_type == VariantObservation::Snp {
+                        (1.0, 0.0)
+                    } else {
+                        (0.0, 1.0)
                     });
+            }
+            // Apply end-of-read cutoff for both passes (TNC estimation and calling).
+            if variant_type == VariantObservation::Snp {
+                if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
+                    continue;
+                }
+            } else if qpos < indel_end_of_read_cutoff || qpos >= read_len - indel_end_of_read_cutoff
+            {
+                continue;
             }
             let is_stranded_read_status = is_stranded_read(&record, stranded_read);
             if (record.is_reverse() && is_stranded_read_status)
@@ -1326,16 +1328,25 @@ fn compute_tnc_error_rates(
         );
         let total_counts_snps: u64 = counts_snps.values().sum::<usize>() as u64;
         let af = total_counts_snps as f64 / depth as f64;
-        if af >= 0.2 {
-            // Accumulate low-AF positions to estimate background error
-            tnc_counts
-                .entry(trinucleotidecontext.clone())
-                .and_modify(|(alt, ref_count)| {
-                    *alt -= total_counts_snps as f64; // subtract high-AF SNPs
-                    *ref_count -= (depth - total_counts_snps as u32) as f64; // subtract high-AF reference counts
-                })
-                .or_insert((total_counts_snps as f64, (depth - total_counts_snps as u32) as f64));
-        } 
+        // if af >= 0.2 {
+        //     // Remove high-AF positions from the background error estimate: they represent
+        //     // true variants, not sequencing errors.  We subtract the counts that were
+        //     // accumulated into tnc_counts during compute_pileup_counts for this position
+        //     // and clamp to zero to guard against rounding / ordering discrepancies.
+        //     if let Some((acc_alt, acc_ref)) = tnc_counts.get(&trinucleotidecontext).cloned() {
+        //         // Estimate how many alt / ref reads at this position fed into the
+        //         // accumulator.  The raw pileup total across SNP+Ref observations is
+        //         // the best proxy available without re-walking the reads.
+        //         let raw_alt = acc_alt.min(total_counts_snps as f64);
+        //         let raw_ref = acc_ref.min((depth as f64 - total_counts_snps as f64).max(0.0));
+        //         tnc_counts
+        //             .entry(trinucleotidecontext.clone())
+        //             .and_modify(|(alt, ref_count)| {
+        //                 *alt = (*alt - raw_alt).max(0.0);
+        //                 *ref_count = (*ref_count - raw_ref).max(0.0);
+        //             });
+        //     }
+        // }
     }
     let mut tnc_error_rates: HashMap<TrinucleotideContext, f64> = HashMap::new();
     for (context, (alt_count, ref_count)) in tnc_counts {
