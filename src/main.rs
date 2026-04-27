@@ -1346,15 +1346,13 @@ fn compute_tnc_error_rates(
         } else {
             0.0
         };
-        if af < 0.3 {
-            tnc_counts
-                .entry(trinucleotidecontext.clone())
-                .and_modify(|(acc_alt, acc_ref)| {
-                    *acc_alt += total_alt_snps as f64;
-                    *acc_ref += total_ref_snps as f64;
-                })
-                .or_insert((total_alt_snps as f64, total_ref_snps as f64));
-        }
+        tnc_counts
+            .entry(trinucleotidecontext.clone())
+            .and_modify(|(acc_alt, acc_ref)| {
+                *acc_alt += total_alt_snps as f64;
+                *acc_ref += total_ref_snps as f64;
+            })
+            .or_insert((total_alt_snps as f64, total_ref_snps as f64));
     }
     let mut tnc_error_rates: HashMap<TrinucleotideContext, f64> = HashMap::new();
     for (context, (alt_count, ref_count)) in tnc_counts {
