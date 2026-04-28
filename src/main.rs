@@ -1374,7 +1374,6 @@ fn compute_tnc_error_rates(
             error_rate
         };
         tnc_error_rates.insert(context, er);
-    println!("TNC Error Rates: {:?}", tnc_error_rates);
     }
     
     Ok(tnc_error_rates)
@@ -1538,8 +1537,6 @@ fn call_variants(
         let (r_one_f_candidates_indels, r_one_f_probabilities_indels) =
             get_count_vec_candidates(&r_one_f_counts_indels, tnc_error_rate, right_tail_pval);
         
-        println!("r one f candidates snps: {:?}", r_one_f_candidates_snps);
-        println!("probabilities snps: {:?}, error rate: {}", r_one_f_probabilities_snps, tnc_error_rate);
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
             &r_one_f_candidates_snps,
