@@ -616,6 +616,7 @@ fn select_candidates_and_counts(
     total_counts: &HashMap<BaseCall, usize>,
     fwd_probabilities: &Vec<f64>,
     rev_probabilities: &Vec<f64>,
+    total_probabilities: &Vec<f64>,
 ) -> (HashSet<BaseCall>, HashMap<BaseCall, usize>, Vec<f64>) {
     let directive =
         find_where_to_call_variants(ref_base, fwd_candidates, upstream_base, downstream_base);
@@ -633,7 +634,7 @@ fn select_candidates_and_counts(
                 .intersection(rev_candidates)
                 .cloned()
                 .collect();
-            (intersection, total_counts.clone(), vec![total_prob])
+            (intersection, total_counts.clone(), total_probabilities.clone())
         }
     }
 }
@@ -692,20 +693,22 @@ fn get_count_vec_candidates(
     counts: &HashMap<BaseCall, usize>,
     error_rate: f64,
     right_tail_pval: f64,
-) -> (HashSet<BaseCall>, Vec<f64>) {
+) -> (HashSet<BaseCall>, Vec<f64>, Vec<bool>) {
     let mut candidates = HashSet::new();
     let mut probabilities = Vec::new();
+    let mut pval_passes = Vec::new();
     let total_depth = counts.values().sum::<usize>() as u64;
 
     for (basecall, &count) in counts.iter() {
         let mut clears_filters = true;
         let variant = basecall.check_variant_type();
         let probability = right_tail_binomial_pval(total_depth, count as u64, error_rate);
+        let pval_pass = probability >= right_tail_pval;
         match variant {
             VariantObservation::Snp
                 if basecall.base == 'N'
-                    || basecall.base == basecall.ref_base
-                    || probability >= right_tail_pval =>
+                    || basecall.base == basecall.ref_base =>
+                    // || probability >= right_tail_pval =>
             {
                 clears_filters = false;
             }
@@ -726,9 +729,10 @@ fn get_count_vec_candidates(
         if clears_filters {
             candidates.insert(basecall.clone());
             probabilities.push(probability);
+            pval_passes.push(pval_pass);
         }
     }
-    (candidates, probabilities)
+    (candidates, probabilities, pval_passes)
 }
 
 /// Assign genotype based on binomial probabilities
@@ -1319,12 +1323,16 @@ fn compute_tnc_error_rates(
             b'N'
         };
 
-        let (r_one_f_candidates_snps, r_one_f_probabilities_snps) = get_count_vec_candidates(&r_one_f_counts_snps, error_rate, right_tail_pval);
-        let (r_one_r_candidates_snps, r_one_r_probabilities_snps) = get_count_vec_candidates(&r_one_r_counts_snps, error_rate, right_tail_pval);
-        let (r_one_r_candidates_indels, r_one_r_probabilities_indels) =
+        let (r_one_f_candidates_snps, r_one_f_probabilities_snps, r_one_f_pval_pass_snps) = get_count_vec_candidates(&r_one_f_counts_snps, error_rate, right_tail_pval);
+        let (r_one_r_candidates_snps, r_one_r_probabilities_snps, r_one_r_pval_pass_snps) = get_count_vec_candidates(&r_one_r_counts_snps, error_rate, right_tail_pval);
+        let (r_one_r_candidates_indels, r_one_r_probabilities_indels, r_one_r_pval_pass_indels) =
             get_count_vec_candidates(&r_one_r_counts_indels, error_rate, right_tail_pval);
-        let (r_one_f_candidates_indels, r_one_f_probabilities_indels) =
+        let (r_one_f_candidates_indels, r_one_f_probabilities_indels, r_one_f_pval_pass_indels) =
             get_count_vec_candidates(&r_one_f_counts_indels, error_rate, right_tail_pval);
+        let (total_candidates_snps, total_probabilities_snps, total_pval_pass_snps) =
+            get_count_vec_candidates(&total_counts_snps, error_rate, right_tail_pval);
+        let (total_candidates_indels, total_probabilities_indels, total_pval_pass_indels) =
+            get_count_vec_candidates(&total_counts_indels, error_rate, right_tail_pval);
         
         let trinucleotidecontext = TrinucleotideContext::new(upstream_base, ref_base as u8, downstream_base);
         let (candidate_snps, counts_snps, probabilities_snps) = select_candidates_and_counts(
@@ -1338,6 +1346,7 @@ fn compute_tnc_error_rates(
             &total_counts_snps,
             &r_one_f_probabilities_snps,
             &r_one_r_probabilities_snps,
+            &total_probabilities_snps,
         );
         let total_ref_snps: u64 = counts_snps
             .iter()
@@ -1530,12 +1539,16 @@ fn call_variants(
             .cloned()
             .unwrap_or(error_rate); 
 
-        let (r_one_f_candidates_snps, r_one_f_probabilities_snps) = get_count_vec_candidates(&r_one_f_counts_snps, tnc_error_rate, right_tail_pval);
-        let (r_one_r_candidates_snps, r_one_r_probabilities_snps) = get_count_vec_candidates(&r_one_r_counts_snps, tnc_error_rate, right_tail_pval);
-        let (r_one_r_candidates_indels, r_one_r_probabilities_indels) =
+        let (r_one_f_candidates_snps, r_one_f_probabilities_snps, r_one_f_pval_pass_snps) = get_count_vec_candidates(&r_one_f_counts_snps, tnc_error_rate, right_tail_pval);
+        let (r_one_r_candidates_snps, r_one_r_probabilities_snps, r_one_r_pval_pass_snps) = get_count_vec_candidates(&r_one_r_counts_snps, tnc_error_rate, right_tail_pval);
+        let (r_one_r_candidates_indels, r_one_r_probabilities_indels, r_one_r_pval_pass_indels) =
             get_count_vec_candidates(&r_one_r_counts_indels, tnc_error_rate, right_tail_pval);
-        let (r_one_f_candidates_indels, r_one_f_probabilities_indels) =
+        let (r_one_f_candidates_indels, r_one_f_probabilities_indels, r_one_f_pval_pass_indels) =
             get_count_vec_candidates(&r_one_f_counts_indels, tnc_error_rate, right_tail_pval);
+        let (total_candidates_snps, total_probabilities_snps, total_pval_pass_snps) =
+            get_count_vec_candidates(&total_counts_snps, tnc_error_rate, right_tail_pval);
+        let (total_candidates_indels, total_probabilities_indels, total_pval_pass_indels) =
+            get_count_vec_candidates(&total_counts_indels, tnc_error_rate, right_tail_pval);
         
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
@@ -1555,6 +1568,7 @@ fn call_variants(
             &total_counts_snps,
             &r_one_f_probabilities_snps,
             &r_one_r_probabilities_snps,
+            &total_probabilities_snps,
         );
 
         let (candidate_indels, counts_indels, probabilities_indels) = select_candidates_and_counts(
@@ -1568,6 +1582,7 @@ fn call_variants(
             &total_counts_indels,
             &r_one_f_probabilities_indels,
             &r_one_r_probabilities_indels,
+            &total_probabilities_indels,
         );
 
         let total_depth_snps = counts_snps.values().sum::<usize>() as u64;
@@ -1584,9 +1599,6 @@ fn call_variants(
                     continue;
                 }
                 let (genotype, is_somatic) = assign_genotype(*alt_counts, total_depth as usize, tnc_error_rate);
-                if genotype.genotype == "0/0" {
-                    continue;
-                }
 
                 let variant = Variant::new(
                     ref_name.to_string(),
@@ -1615,9 +1627,6 @@ fn call_variants(
                     continue;
                 }
                 let (genotype, is_somatic) = assign_genotype(*alt_counts, total_depth_filtered as usize, 0.05);
-                if genotype.genotype == "0/0" && !is_somatic {
-                    continue;
-                }
 
                 let variant = Variant::new(
                     ref_name.to_string(),
