@@ -130,6 +130,10 @@ struct Variant {
     tnc: TrinucleotideContext,
     right_tail_pval: f64,
     probability: f64,
+    mapq_filtered_ref: f64,
+    mapq_filtered_alt: f64,
+    bq_filtered_ref: f64,
+    bq_filtered_alt: f64,
 }
 
 impl Variant {
@@ -164,6 +168,10 @@ impl Variant {
         tnc: TrinucleotideContext,
         right_tail_pval: f64,
         probability: f64,
+        mapq_filtered_ref: f64,
+        mapq_filtered_alt: f64,
+        bq_filtered_ref: f64,
+        bq_filtered_alt: f64,
     ) -> Self {
         Variant {
             contig,
@@ -180,6 +188,10 @@ impl Variant {
             tnc,
             right_tail_pval,
             probability,
+            mapq_filtered_ref,
+            mapq_filtered_alt,
+            bq_filtered_ref,
+            bq_filtered_alt,
         }
     }
 
@@ -212,7 +224,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR\t{}:{}:{}:{}:{}{}{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA\t{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -235,6 +247,10 @@ impl Variant {
             self.tnc.ref_base as char,
             self.tnc.downstream_base as char,
             self.probability,
+            self.mapq_filtered_ref,
+            self.mapq_filtered_alt,
+            self.bq_filtered_ref,
+            self.bq_filtered_alt,
         )
     }
 }
@@ -926,11 +942,15 @@ fn compute_pileup_counts(
     indel_filter_repeat_limit: usize,
     dinuc_cutoff: usize,
     mut tnc_error_rate: Option<&mut HashMap<TrinucleotideContext, (f64, f64)>>,  
-) -> u64 {
+) -> (f64, f64, f64, f64, u64) {
     pileup_counts.fwd.clear();
     pileup_counts.rev.clear();
     pileup_counts.total.clear();
     let mut indel_offset = 0;
+    let mut mapq_filtered_ref = 0;
+    let mut mapq_filtered_alt = 0;
+    let mut bq_filtered_ref = 0;
+    let mut bq_filtered_alt = 0;
 
     for alignment in pileup.alignments() {
         let record = alignment.record();
@@ -943,6 +963,8 @@ fn compute_pileup_counts(
             let base = record.seq().as_bytes()[qpos] as char;
             let qual = record.qual()[qpos];
             let mapq = record.mapq();
+            let basecall = BaseCall::new(&alignment, ref_seq, ref_pos);
+            let variant_type = basecall.check_variant_type();
 
             if alignment.is_del() || alignment.is_refskip() {
                 continue;
@@ -951,19 +973,26 @@ fn compute_pileup_counts(
                 continue;
             }
             if qual < min_bq as u8 {
+                if variant_type == VariantObservation::Ref {
+                    bq_filtered_ref += 1;
+                } else {
+                    bq_filtered_alt += 1;
+                }
                 continue;
             }
+
             if mapq < min_mapq as u8 {
+                if variant_type == VariantObservation::Ref {
+                    mapq_filtered_ref += 1;
+                } else {
+                    mapq_filtered_alt += 1;
+                }
                 continue;
             }
 
             if record.is_secondary() || record.is_supplementary() || record.is_duplicate() {
                 continue;
             }
-
-            let basecall = BaseCall::new(&alignment, ref_seq, ref_pos);
-
-            let variant_type = basecall.check_variant_type();
 
             let read_len = record.seq().len();
 
@@ -1041,7 +1070,7 @@ fn compute_pileup_counts(
         }
     }
 
-    indel_offset
+    (mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, indel_offset as u64)
 }
 
 /// Main workflow for variant calling
@@ -1272,7 +1301,7 @@ fn compute_tnc_error_rates(
             indel_filter_repeat_limit
         };
 
-        let indel_offset = compute_pileup_counts(
+        let (mapq_filtered_ref, mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1483,7 +1512,7 @@ fn call_variants(
             indel_filter_repeat_limit
         };
 
-        let indel_offset = compute_pileup_counts(
+        let (mapq_filtered_ref,  mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1615,6 +1644,10 @@ fn call_variants(
                     trinucleotidecontext.clone(),
                     right_tail_pval,
                     total_probability_snps,
+                    mapq_filtered_ref,
+                    mapq_filtered_alt,
+                    bq_filtered_ref,
+                    bq_filtered_alt,
                 );
                 variants.push(variant);
             }
@@ -1643,6 +1676,10 @@ fn call_variants(
                     trinucleotidecontext.clone(),
                     right_tail_pval,
                     total_probability_indels,
+                    mapq_filtered_ref,
+                    mapq_filtered_alt,
+                    bq_filtered_ref,
+                    bq_filtered_alt,
                 );
                 variants.push(variant);
             }
@@ -1755,7 +1792,7 @@ mod tests {
                     0.05, // right_tail_pval
                 )
                 .expect("call_variants failed");
-
+                println!("Variants found: {:?}", variants);
                 if variants.is_empty() {
                     println!("Warning: No variants called");
                 }
