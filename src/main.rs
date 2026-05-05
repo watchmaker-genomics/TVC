@@ -134,6 +134,10 @@ struct Variant {
     mapq_filtered_alt: f64,
     bq_filtered_ref: f64,
     bq_filtered_alt: f64,
+    average_ref_mapq: f64,
+    average_alt_mapq: f64, 
+    average_ref_bq: f64,
+    average_alt_bq: f64,
 }
 
 impl Variant {
@@ -172,6 +176,10 @@ impl Variant {
         mapq_filtered_alt: f64,
         bq_filtered_ref: f64,
         bq_filtered_alt: f64,
+        average_ref_mapq: f64,
+        average_alt_mapq: f64,
+        average_ref_bq: f64,
+        average_alt_bq: f64,
     ) -> Self {
         Variant {
             contig,
@@ -192,6 +200,10 @@ impl Variant {
             mapq_filtered_alt,
             bq_filtered_ref,
             bq_filtered_alt,
+            average_ref_mapq,
+            average_alt_mapq,
+            average_ref_bq,
+            average_alt_bq,
         }
     }
 
@@ -224,7 +236,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA\t{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA\t{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -251,6 +263,10 @@ impl Variant {
             self.mapq_filtered_alt,
             self.bq_filtered_ref,
             self.bq_filtered_alt,
+            self.average_ref_mapq,
+            self.average_alt_mapq,
+            self.average_ref_bq,
+            self.average_alt_mapq,
         )
     }
 }
@@ -942,7 +958,7 @@ fn compute_pileup_counts(
     indel_filter_repeat_limit: usize,
     dinuc_cutoff: usize,
     mut tnc_error_rate: Option<&mut HashMap<TrinucleotideContext, (f64, f64)>>,  
-) -> (f64, f64, f64, f64, u64) {
+) -> (f64, f64, f64, f64, f64, f64, f64, f64, u64) {
     pileup_counts.fwd.clear();
     pileup_counts.rev.clear();
     pileup_counts.total.clear();
@@ -951,6 +967,11 @@ fn compute_pileup_counts(
     let mut mapq_filtered_alt = 0;
     let mut bq_filtered_ref = 0;
     let mut bq_filtered_alt = 0;
+    let mut count_ref_mapq = 0;
+    let mut count_alt_mapq = 0; 
+    let mut count_ref_bq = 0;
+    let mut count_alt_bq = 0;
+
 
     for alignment in pileup.alignments() {
         let record = alignment.record();
@@ -979,6 +1000,14 @@ fn compute_pileup_counts(
                     bq_filtered_alt += 1;
                 }
                 continue;
+            }
+            
+            if variant_type == VariantObservation::Ref {
+                count_ref_mapq += mapq as u64;
+                count_ref_bq += qual as u64;
+            } else {
+                count_alt_mapq += mapq as u64;
+                count_alt_bq += qual as u64;
             }
 
             if mapq < min_mapq as u8 {
@@ -1070,7 +1099,7 @@ fn compute_pileup_counts(
         }
     }
 
-    (mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, indel_offset as u64)
+    (count_ref_mapq as f64, count_alt_mapq as f64, count_ref_bq as f64, count_alt_bq as f64, mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, indel_offset as u64)
 }
 
 /// Main workflow for variant calling
@@ -1301,7 +1330,7 @@ fn compute_tnc_error_rates(
             indel_filter_repeat_limit
         };
 
-        let (mapq_filtered_ref, mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, indel_offset) = compute_pileup_counts(
+        let (count_ref_mapq , count_alt_mapq , count_ref_bq , count_alt_bq , mapq_filtered_ref , mapq_filtered_alt , bq_filtered_ref , bq_filtered_alt , indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1512,7 +1541,7 @@ fn call_variants(
             indel_filter_repeat_limit
         };
 
-        let (mapq_filtered_ref,  mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, indel_offset) = compute_pileup_counts(
+        let (count_ref_mapq , count_alt_mapq , count_ref_bq , count_alt_bq , mapq_filtered_ref , mapq_filtered_alt , bq_filtered_ref , bq_filtered_alt , indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1527,6 +1556,27 @@ fn call_variants(
             dinuc_cutoff,
             None,
         );
+
+        let average_ref_mapq = if count_ref_mapq > 0.0 && count_ref_bq > 0.0 {
+            count_ref_mapq as f64 / count_ref_bq as f64
+        } else {
+            0.0
+        };
+        let average_alt_mapq = if count_alt_mapq > 0.0 && count_alt_bq > 0.0 {
+            count_alt_mapq as f64 / count_alt_bq as f64
+        } else {
+            0.0
+        };
+        let average_ref_bq = if count_ref_bq > 0.0 {
+            count_ref_bq as f64 / count_ref_mapq as f64
+        } else {
+            0.0
+        };
+        let average_alt_bq = if count_alt_bq > 0.0 {
+            count_alt_bq as f64 / count_alt_mapq as f64
+        } else {
+            0.0
+        };
 
         r_one_f_counts_snps.clear();
         r_one_r_counts_snps.clear();
@@ -1648,6 +1698,10 @@ fn call_variants(
                     mapq_filtered_alt,
                     bq_filtered_ref,
                     bq_filtered_alt,
+                    average_ref_mapq,
+                    average_alt_mapq,
+                    average_ref_bq,
+                    average_alt_bq,
                 );
                 variants.push(variant);
             }
@@ -1680,6 +1734,10 @@ fn call_variants(
                     mapq_filtered_alt,
                     bq_filtered_ref,
                     bq_filtered_alt,
+                    average_ref_mapq,
+                    average_alt_mapq,
+                    average_ref_bq,
+                    average_alt_bq,
                 );
                 variants.push(variant);
             }
