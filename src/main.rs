@@ -958,7 +958,7 @@ fn compute_pileup_counts(
     indel_filter_repeat_limit: usize,
     dinuc_cutoff: usize,
     mut tnc_error_rate: Option<&mut HashMap<TrinucleotideContext, (f64, f64)>>,  
-) -> (f64, f64, f64, f64, f64, f64, f64, f64, u64) {
+) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, u64) {
     pileup_counts.fwd.clear();
     pileup_counts.rev.clear();
     pileup_counts.total.clear();
@@ -971,6 +971,8 @@ fn compute_pileup_counts(
     let mut count_alt_mapq = 0; 
     let mut count_ref_bq = 0;
     let mut count_alt_bq = 0;
+    let mut total_alt_counts = 0;
+    let mut total_ref_counts = 0;
 
 
     for alignment in pileup.alignments() {
@@ -992,6 +994,11 @@ fn compute_pileup_counts(
             }
             if base == 'N' {
                 continue;
+            }
+            if variant_type == VariantObservation::Snp {
+                total_alt_counts += 1;
+            } else if variant_type == VariantObservation::Ref {
+                total_ref_counts += 1;
             }
             if qual < min_bq as u8 {
                 if variant_type == VariantObservation::Ref {
@@ -1099,7 +1106,7 @@ fn compute_pileup_counts(
         }
     }
 
-    (count_ref_mapq as f64, count_alt_mapq as f64, count_ref_bq as f64, count_alt_bq as f64, mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, indel_offset as u64)
+    (total_alt_counts as f64, total_ref_counts as f64, count_ref_mapq as f64, count_alt_mapq as f64, count_ref_bq as f64, count_alt_bq as f64, mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, indel_offset as u64)
 }
 
 /// Main workflow for variant calling
@@ -1330,7 +1337,7 @@ fn compute_tnc_error_rates(
             indel_filter_repeat_limit
         };
 
-        let (count_ref_mapq , count_alt_mapq , count_ref_bq , count_alt_bq , mapq_filtered_ref , mapq_filtered_alt , bq_filtered_ref , bq_filtered_alt , indel_offset) = compute_pileup_counts(
+        let (total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq , count_alt_bq , mapq_filtered_ref , mapq_filtered_alt , bq_filtered_ref , bq_filtered_alt , indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1541,7 +1548,7 @@ fn call_variants(
             indel_filter_repeat_limit
         };
 
-        let (count_ref_mapq , count_alt_mapq , count_ref_bq , count_alt_bq , mapq_filtered_ref , mapq_filtered_alt , bq_filtered_ref , bq_filtered_alt , indel_offset) = compute_pileup_counts(
+        let (total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq , count_alt_bq , mapq_filtered_ref , mapq_filtered_alt , bq_filtered_ref , bq_filtered_alt , indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1558,22 +1565,22 @@ fn call_variants(
         );
 
         let average_ref_mapq = if count_ref_mapq > 0.0 && count_ref_bq > 0.0 {
-            count_ref_mapq as f64 / count_ref_bq as f64
+            count_ref_mapq as f64 / total_ref_counts as f64
         } else {
             0.0
         };
         let average_alt_mapq = if count_alt_mapq > 0.0 && count_alt_bq > 0.0 {
-            count_alt_mapq as f64 / count_alt_bq as f64
+            count_alt_mapq as f64 / total_alt_counts as f64
         } else {
             0.0
         };
         let average_ref_bq = if count_ref_bq > 0.0 {
-            count_ref_bq as f64 / count_ref_mapq as f64
+            count_ref_bq as f64 / total_ref_counts as f64
         } else {
             0.0
         };
         let average_alt_bq = if count_alt_bq > 0.0 {
-            count_alt_bq as f64 / count_alt_mapq as f64
+            count_alt_bq as f64 / total_alt_counts as f64
         } else {
             0.0
         };
@@ -1850,7 +1857,6 @@ mod tests {
                     0.05, // right_tail_pval
                 )
                 .expect("call_variants failed");
-                println!("Variants found: {:?}", variants);
                 if variants.is_empty() {
                     println!("Warning: No variants called");
                 }
