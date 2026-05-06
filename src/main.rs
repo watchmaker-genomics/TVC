@@ -144,6 +144,7 @@ struct Variant {
     avg_alt_insert_size: f64,
     fwd_probability: f64,
     rev_probability: f64,
+    local_entropy: f64,
 }
 
 impl Variant {
@@ -192,6 +193,7 @@ impl Variant {
         avg_alt_insert_size: f64,
         fwd_probability: f64,
         rev_probability: f64,
+        local_entropy: f64,
     ) -> Self {
         Variant {
             contig,
@@ -222,6 +224,7 @@ impl Variant {
             avg_alt_insert_size,
             fwd_probability,
             rev_probability,
+            local_entropy,
         }
     }
 
@@ -254,7 +257,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:REDR:REDA:ISR:ISA:FWD:REV\t{}:{}:{}:{}:{}{}{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:REDR:REDA:ISR:ISA:FWD:REV:LE\t{}:{}:{}:{}:{}{}{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -291,6 +294,7 @@ impl Variant {
             self.avg_alt_insert_size,
             self.fwd_probability,
             self.rev_probability,
+            self.local_entropy,
         )
     }
 }
@@ -961,7 +965,34 @@ impl TrinucleotideContext {
 }
 }
 
-
+fn shannon_entropy(sequence: &[u8]) -> f64 {
+    if sequence.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 4];
+    let mut valid = 0u32;
+    for &base in sequence {
+        match base {
+            b'A' | b'a' => counts[0] += 1,
+            b'C' | b'c' => counts[1] += 1,
+            b'G' | b'g' => counts[2] += 1,
+            b'T' | b't' => counts[3] += 1,
+            _ => {}  // skip N and anything else
+        }
+        valid += 1;
+    }
+    if valid == 0 {
+        return 0.0;
+    }
+    let n = valid as f64;
+    counts.iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / n;
+            -p * p.log2()
+        })
+        .sum()
+}
 
 /// Compute base call counts from a pileup
 ///
@@ -1684,6 +1715,11 @@ fn call_variants(
         } else {
             b'N'
         };
+        
+        let flank = 50usize;
+        let flank_start = (pos as usize).saturating_sub(flank);
+        let flank_end = ((pos as usize) + flank + 1).min(ref_seq.len());
+        let local_entropy = shannon_entropy(&ref_seq[flank_start..flank_end]);
 
         let trinucleotidecontext = TrinucleotideContext::new(upstream_base, ref_base as u8, downstream_base);
         let tnc_error_rate = error_map
@@ -1793,6 +1829,7 @@ fn call_variants(
                     avg_alt_insert_size,
                     forward_strand_bias_snps,
                     reverse_strand_bias_snps,
+                    local_entropy,
                 );
                 variants.push(variant);
             }
@@ -1835,6 +1872,7 @@ fn call_variants(
                     avg_alt_insert_size,
                     forward_strand_bias_indels,
                     reverse_strand_bias_indels,
+                    local_entropy,
                 );
                 variants.push(variant);
             }
