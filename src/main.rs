@@ -138,6 +138,10 @@ struct Variant {
     average_alt_mapq: f64, 
     average_ref_bq: f64,
     average_alt_bq: f64,
+    avg_ref_dist_from_read_end: f64,
+    avg_alt_dist_from_read_end: f64,
+    avg_ref_insert_size: f64,
+    avg_alt_insert_size: f64,
 }
 
 impl Variant {
@@ -180,6 +184,10 @@ impl Variant {
         average_alt_mapq: f64,
         average_ref_bq: f64,
         average_alt_bq: f64,
+        avg_ref_dist_from_read_end: f64,
+        avg_alt_dist_from_read_end: f64,
+        avg_ref_insert_size: f64,
+        avg_alt_insert_size: f64,
     ) -> Self {
         Variant {
             contig,
@@ -204,6 +212,10 @@ impl Variant {
             average_alt_mapq,
             average_ref_bq,
             average_alt_bq,
+            avg_ref_dist_from_read_end,
+            avg_alt_dist_from_read_end,
+            avg_ref_insert_size,
+            avg_alt_insert_size,
         }
     }
 
@@ -236,7 +248,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA\t{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA\t{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -267,6 +279,10 @@ impl Variant {
             self.average_alt_mapq,
             self.average_ref_bq,
             self.average_alt_mapq,
+            self.avg_ref_dist_from_read_end,
+            self.avg_alt_dist_from_read_end,
+            self.avg_ref_insert_size,
+            self.avg_alt_insert_size,
         )
     }
 }
@@ -701,6 +717,15 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n\
 ##FORMAT=<ID=ER,Number=1,Type=Float,Description=\"Estimated Error Rate\">\n\
 ##FORMAT=<ID=TNC,Number=3,Type=String,Description=\"Trinucleotide Context (upstream,ref,downstream)\">\n\
+##FORMAT=<ID=PR,Number=1,Type=Float,Description=\"Probability of the called genotype\">\n\
+##FORMAT=<ID=MFR,Number=1,Type=Float,Description=\"Mean mapping quality of reads supporting the reference allele\">\n\
+##FORMAT=<ID=MFA,Number=1,Type=Float,Description=\"Mean mapping quality of reads supporting the alternate allele\">\n\
+##FORMAT=<ID=BFR,Number=1,Type=Float,Description=\"Mean base quality of reads supporting the reference allele\">\n\
+##FORMAT=<ID=BFA,Number=1,Type=Float,Description=\"Mean base quality of reads supporting the alternate allele\">\n\
+##FORMAT=<ID=ARDE,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the reference allele\">\n\
+##FORMAT=<ID=AADE,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n
+##FORMAT=<ID=ARIS,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n\
+##FORMAT=<ID=AAIS,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
         contigs
     )
@@ -958,7 +983,7 @@ fn compute_pileup_counts(
     indel_filter_repeat_limit: usize,
     dinuc_cutoff: usize,
     mut tnc_error_rate: Option<&mut HashMap<TrinucleotideContext, (f64, f64)>>,  
-) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, u64) {
+) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, u64) {
     pileup_counts.fwd.clear();
     pileup_counts.rev.clear();
     pileup_counts.total.clear();
@@ -973,6 +998,12 @@ fn compute_pileup_counts(
     let mut count_alt_bq = 0;
     let mut total_alt_counts = 0;
     let mut total_ref_counts = 0;
+    let mut insert_size_count = 0;
+    let mut alt_dist_from_read_end_count = 0;
+    let mut ref_dist_from_read_end_count = 0;
+    let mut alt_insert_size_sum = 0;
+    let mut ref_insert_size_sum = 0;
+
 
 
     for alignment in pileup.alignments() {
@@ -1024,6 +1055,14 @@ fn compute_pileup_counts(
                     mapq_filtered_alt += 1;
                 }
                 continue;
+            }
+
+            if variant_type == VariantObservation::Ref {
+                ref_dist_from_read_end_count += std::cmp::min(qpos, record.seq().len() - 1 - qpos) as u64;
+                ref_insert_size_sum += record.insert_size().abs() as u64;
+            } else {
+                alt_dist_from_read_end_count += std::cmp::min(qpos, record.seq().len() - 1 - qpos) as u64;
+                alt_insert_size_sum += record.insert_size().abs() as u64;
             }
 
             if record.is_secondary() || record.is_supplementary() || record.is_duplicate() {
@@ -1106,9 +1145,8 @@ fn compute_pileup_counts(
         }
     }
 
-    (total_alt_counts as f64, total_ref_counts as f64, count_ref_mapq as f64, count_alt_mapq as f64, count_ref_bq as f64, count_alt_bq as f64, mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, indel_offset as u64)
+    (ref_dist_from_read_end_count as f64, alt_dist_from_read_end_count as f64,  ref_insert_size_sum as f64, alt_insert_size_sum as f64, total_alt_counts as f64, total_ref_counts as f64, count_ref_mapq as f64, count_alt_mapq as f64, count_ref_bq as f64, count_alt_bq as f64, mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, indel_offset as u64)
 }
-
 /// Main workflow for variant calling
 ///
 /// # Arguments
@@ -1337,7 +1375,7 @@ fn compute_tnc_error_rates(
             indel_filter_repeat_limit
         };
 
-        let (total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq , count_alt_bq , mapq_filtered_ref , mapq_filtered_alt , bq_filtered_ref , bq_filtered_alt , indel_offset) = compute_pileup_counts(
+        let (ref_dist_from_read_end_count, alt_dist_from_read_end_count, ref_insert_size_sum, alt_insert_size_sum, total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq, count_alt_bq, mapq_filtered_ref, mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1548,7 +1586,7 @@ fn call_variants(
             indel_filter_repeat_limit
         };
 
-        let (total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq , count_alt_bq , mapq_filtered_ref , mapq_filtered_alt , bq_filtered_ref , bq_filtered_alt , indel_offset) = compute_pileup_counts(
+        let (ref_dist_from_read_end_count, alt_dist_from_read_end_count, ref_insert_size_sum, alt_insert_size_sum, total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq, count_alt_bq, mapq_filtered_ref, mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1581,6 +1619,26 @@ fn call_variants(
         };
         let average_alt_bq = if count_alt_bq > 0.0 {
             count_alt_bq as f64 / total_alt_counts as f64
+        } else {
+            0.0
+        };
+        let avg_ref_dist_from_read_end = if total_ref_counts > 0.0 {
+            ref_dist_from_read_end_count / total_ref_counts as f64
+        } else {
+            0.0
+        };
+        let avg_alt_dist_from_read_end = if total_alt_counts > 0.0 {
+            alt_dist_from_read_end_count / total_alt_counts as f64
+        } else {
+            0.0
+        };
+        let avg_ref_insert_size = if total_ref_counts > 0.0 {
+            ref_insert_size_sum / total_ref_counts as f64
+        } else {
+            0.0
+        };
+        let avg_alt_insert_size = if total_alt_counts > 0.0 {
+            alt_insert_size_sum / total_alt_counts as f64
         } else {
             0.0
         };
@@ -1709,6 +1767,10 @@ fn call_variants(
                     average_alt_mapq,
                     average_ref_bq,
                     average_alt_bq,
+                    avg_ref_dist_from_read_end,
+                    avg_alt_dist_from_read_end,
+                    avg_ref_insert_size,
+                    avg_alt_insert_size,
                 );
                 variants.push(variant);
             }
@@ -1745,6 +1807,10 @@ fn call_variants(
                     average_alt_mapq,
                     average_ref_bq,
                     average_alt_bq,
+                    avg_ref_dist_from_read_end,
+                    avg_alt_dist_from_read_end,
+                    avg_ref_insert_size,
+                    avg_alt_insert_size,
                 );
                 variants.push(variant);
             }
@@ -1860,6 +1926,7 @@ mod tests {
                 if variants.is_empty() {
                     println!("Warning: No variants called");
                 }
+                println!("Called variants: {:?}", variants);
 
                 let matching_variant = variants
                     .iter()
