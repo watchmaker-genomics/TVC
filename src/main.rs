@@ -142,6 +142,8 @@ struct Variant {
     avg_alt_dist_from_read_end: f64,
     avg_ref_insert_size: f64,
     avg_alt_insert_size: f64,
+    fwd_probability: f64,
+    rev_probability: f64,
 }
 
 impl Variant {
@@ -188,6 +190,8 @@ impl Variant {
         avg_alt_dist_from_read_end: f64,
         avg_ref_insert_size: f64,
         avg_alt_insert_size: f64,
+        fwd_probability: f64,
+        rev_probability: f64,
     ) -> Self {
         Variant {
             contig,
@@ -216,6 +220,8 @@ impl Variant {
             avg_alt_dist_from_read_end,
             avg_ref_insert_size,
             avg_alt_insert_size,
+            fwd_probability,
+            rev_probability,
         }
     }
 
@@ -248,7 +254,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA\t{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:REDR:REDA:ISR:ISA:FWD:REV\t{}:{}:{}:{}:{}{}{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -278,11 +284,13 @@ impl Variant {
             self.average_ref_mapq,
             self.average_alt_mapq,
             self.average_ref_bq,
-            self.average_alt_mapq,
+            self.average_alt_bq,
             self.avg_ref_dist_from_read_end,
             self.avg_alt_dist_from_read_end,
             self.avg_ref_insert_size,
             self.avg_alt_insert_size,
+            self.fwd_probability,
+            self.rev_probability,
         )
     }
 }
@@ -1026,11 +1034,7 @@ fn compute_pileup_counts(
             if base == 'N' {
                 continue;
             }
-            if variant_type == VariantObservation::Snp {
-                total_alt_counts += 1;
-            } else if variant_type == VariantObservation::Ref {
-                total_ref_counts += 1;
-            }
+
             if qual < min_bq as u8 {
                 if variant_type == VariantObservation::Ref {
                     bq_filtered_ref += 1;
@@ -1038,14 +1042,6 @@ fn compute_pileup_counts(
                     bq_filtered_alt += 1;
                 }
                 continue;
-            }
-            
-            if variant_type == VariantObservation::Ref {
-                count_ref_mapq += mapq as u64;
-                count_ref_bq += qual as u64;
-            } else {
-                count_alt_mapq += mapq as u64;
-                count_alt_bq += qual as u64;
             }
 
             if mapq < min_mapq as u8 {
@@ -1055,6 +1051,18 @@ fn compute_pileup_counts(
                     mapq_filtered_alt += 1;
                 }
                 continue;
+            }
+            if variant_type == VariantObservation::Ref {
+                total_ref_counts += 1;
+            } else {
+                total_alt_counts += 1;
+            }
+            if variant_type == VariantObservation::Ref {
+                count_ref_mapq += mapq as u64;
+                count_ref_bq += qual as u64;
+            } else {
+                count_alt_mapq += mapq as u64;
+                count_alt_bq += qual as u64;
             }
 
             if variant_type == VariantObservation::Ref {
@@ -1602,42 +1610,42 @@ fn call_variants(
             None,
         );
 
-        let average_ref_mapq = if count_ref_mapq > 0.0 && count_ref_bq > 0.0 {
+        let average_ref_mapq = if count_ref_mapq > 0.0 && total_ref_counts > 0.0 {
             count_ref_mapq as f64 / total_ref_counts as f64
         } else {
             0.0
         };
-        let average_alt_mapq = if count_alt_mapq > 0.0 && count_alt_bq > 0.0 {
+        let average_alt_mapq = if count_alt_mapq > 0.0 && total_alt_counts > 0.0 {
             count_alt_mapq as f64 / total_alt_counts as f64
         } else {
             0.0
         };
-        let average_ref_bq = if count_ref_bq > 0.0 {
+        let average_ref_bq = if count_ref_bq > 0.0 && total_ref_counts > 0.0 {
             count_ref_bq as f64 / total_ref_counts as f64
         } else {
             0.0
         };
-        let average_alt_bq = if count_alt_bq > 0.0 {
+        let average_alt_bq = if count_alt_bq > 0.0 && total_alt_counts > 0.0 {
             count_alt_bq as f64 / total_alt_counts as f64
         } else {
             0.0
         };
-        let avg_ref_dist_from_read_end = if total_ref_counts > 0.0 {
+        let avg_ref_dist_from_read_end = if ref_dist_from_read_end_count > 0.0 && total_ref_counts > 0.0 {
             ref_dist_from_read_end_count / total_ref_counts as f64
         } else {
             0.0
         };
-        let avg_alt_dist_from_read_end = if total_alt_counts > 0.0 {
+        let avg_alt_dist_from_read_end = if alt_dist_from_read_end_count > 0.0 && total_alt_counts > 0.0 {
             alt_dist_from_read_end_count / total_alt_counts as f64
         } else {
             0.0
         };
-        let avg_ref_insert_size = if total_ref_counts > 0.0 {
+        let avg_ref_insert_size = if ref_insert_size_sum > 0.0 && total_ref_counts > 0.0 {
             ref_insert_size_sum / total_ref_counts as f64
         } else {
             0.0
         };
-        let avg_alt_insert_size = if total_alt_counts > 0.0 {
+        let avg_alt_insert_size = if alt_insert_size_sum > 0.0 && total_alt_counts > 0.0 {
             alt_insert_size_sum / total_alt_counts as f64
         } else {
             0.0
@@ -1736,6 +1744,18 @@ fn call_variants(
         let directive_indels = CallingDirective::BothStrands;
         let total_probability_snps: f64 = probabilities_snps.into_iter().sum();
         let total_probability_indels: f64 = probabilities_indels.into_iter().sum();
+        let fwd_prob_sum = r_one_f_probabilities_snps.iter().sum::<f64>();
+        let rev_prob_sum = r_one_r_probabilities_snps.iter().sum::<f64>();
+        let combined_total = (fwd_prob_sum + rev_prob_sum).max(1e-10);
+        let forward_strand_bias_snps = fwd_prob_sum / combined_total;
+        let reverse_strand_bias_snps = rev_prob_sum / combined_total;
+
+        let fwd_prob_sum_indels = r_one_f_probabilities_indels.iter().sum::<f64>();
+        let rev_prob_sum_indels = r_one_r_probabilities_indels.iter().sum::<f64>();
+        let combined_total_indels = (fwd_prob_sum_indels + rev_prob_sum_indels).max(1e-10);
+        let forward_strand_bias_indels = fwd_prob_sum_indels / combined_total_indels;
+        let reverse_strand_bias_indels = rev_prob_sum_indels / combined_total_indels;
+
         if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
             for candidate in candidate_snps {
                 let alt_counts = counts_snps.get(&candidate).unwrap_or(&0);
@@ -1771,6 +1791,8 @@ fn call_variants(
                     avg_alt_dist_from_read_end,
                     avg_ref_insert_size,
                     avg_alt_insert_size,
+                    forward_strand_bias_snps,
+                    reverse_strand_bias_snps,
                 );
                 variants.push(variant);
             }
@@ -1811,6 +1833,8 @@ fn call_variants(
                     avg_alt_dist_from_read_end,
                     avg_ref_insert_size,
                     avg_alt_insert_size,
+                    forward_strand_bias_indels,
+                    reverse_strand_bias_indels,
                 );
                 variants.push(variant);
             }
