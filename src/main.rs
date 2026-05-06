@@ -257,7 +257,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:REDR:REDA:ISR:ISA:FWD:REV:LE\t{}:{}:{}:{}:{}{}{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:REDR:REDA:ISR:ISA:FWD:REV:LE\t{}:{}:{}:{:.3e}:{}{}{}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}\n",
             self.contig,
             self.pos,
             self.reference,
