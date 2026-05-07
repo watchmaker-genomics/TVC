@@ -144,7 +144,8 @@ struct Variant {
     avg_alt_insert_size: f64,
     fwd_probability: f64,
     rev_probability: f64,
-    local_entropy: f64,
+    large_local_entropy: f64,
+    small_local_entropy: f64,
     read_end_filtered_count: f64,
     avg_mismatch_per_read: f64,
     mismatch_filtered_count: f64,
@@ -197,7 +198,8 @@ impl Variant {
         avg_alt_insert_size: f64,
         fwd_probability: f64,
         rev_probability: f64,
-        local_entropy: f64,
+        large_local_entropy: f64,
+        small_local_entropy: f64,
         read_end_filtered_count: f64,
         avg_mismatch_per_read: f64,
         mismatch_filtered_count: f64,
@@ -232,7 +234,8 @@ impl Variant {
             avg_alt_insert_size,
             fwd_probability,
             rev_probability,
-            local_entropy,
+            large_local_entropy,
+            small_local_entropy,
             read_end_filtered_count,
             avg_mismatch_per_read,
             mismatch_filtered_count,
@@ -269,7 +272,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMFR:AMFA:ABFR:ABFA:REDR:REDA:ISR:ISA:FWDP:REVP:LE:AMMR:MFC:ARL\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}:{:.1}:{:.1}:{:.1}:{:.1}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMFR:AMFA:ABFR:ABFA:REDR:REDA:ISR:ISA:FWDP:REVP:LLE:SLE:AMMR:MFC:ARL\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -318,7 +321,8 @@ impl Variant {
             } else {
                 self.rev_probability
             },
-            self.local_entropy,
+            self.large_local_entropy,
+            self.small_local_entropy,
             self.read_end_filtered_count,
             self.avg_mismatch_per_read,
             self.mismatch_filtered_count,
@@ -767,7 +771,8 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=REDA,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n\
 ##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Probability of the called genotype based on forward strand reads only\">\n\
 ##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Probability of the called genotype based on reverse strand reads only\">\n\
-##FORMAT=<ID=LE,Number=1,Type=Float,Description=\"Local sequence entropy\">\n\
+##FORMAT=<ID=LLE,Number=1,Type=Float,Description=\"Large Local sequence entropy (50 bp on either side)\">\n\
+##FORMAT=<ID=SLE,Number=1,Type=Float,Description=\"Small local sequence entropy (15 bp on either side)\">\n\
 ##FORMAT=<ID=AMMR,Number=1,Type=Float,Description=\"Average number of mismatches per read at the position\">\n\
 ##FORMAT=<ID=MFC,Number=1,Type=Float,Description=\"Count of reads filtered due to mismatches at the position\">\n\
 ##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n\
@@ -1775,10 +1780,15 @@ fn call_variants(
             b'N'
         };
         
-        let flank = 50usize;
-        let flank_start = (pos as usize).saturating_sub(flank);
-        let flank_end = ((pos as usize) + flank + 1).min(ref_seq.len());
-        let local_entropy = shannon_entropy(&ref_seq[flank_start..flank_end]);
+        let large_flank = 50usize;
+        let large_flank_start = (pos as usize).saturating_sub(large_flank);
+        let large_flank_end = ((pos as usize) + large_flank + 1).min(ref_seq.len());
+        let large_local_entropy = shannon_entropy(&ref_seq[large_flank_start..large_flank_end]);
+
+        let small_flank = 15usize;
+        let small_flank_start = (pos as usize).saturating_sub(small_flank);
+        let small_flank_end = ((pos as usize) + small_flank + 1).min(ref_seq.len());
+        let small_local_entropy = shannon_entropy(&ref_seq[small_flank_start..small_flank_end]);
 
         let trinucleotidecontext = TrinucleotideContext::new(upstream_base, ref_base as u8, downstream_base);
         let tnc_error_rate = error_map
@@ -1888,7 +1898,8 @@ fn call_variants(
                     avg_alt_insert_size,
                     forward_strand_bias_snps,
                     reverse_strand_bias_snps,
-                    local_entropy,
+                    large_local_entropy,
+                    small_local_entropy,
                     read_end_filtered_count_snps,
                     avg_mismatch_per_read,
                     mismatch_filtered_count,
@@ -1935,7 +1946,8 @@ fn call_variants(
                     avg_alt_insert_size,
                     forward_strand_bias_indels,
                     reverse_strand_bias_indels,
-                    local_entropy,
+                    large_local_entropy,
+                    small_local_entropy,
                     read_end_filtered_count_indels,
                     avg_mismatch_per_read,
                     mismatch_filtered_count,
