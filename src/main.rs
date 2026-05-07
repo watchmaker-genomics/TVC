@@ -145,6 +145,10 @@ struct Variant {
     fwd_probability: f64,
     rev_probability: f64,
     local_entropy: f64,
+    read_end_filtered_count: f64,
+    avg_mismatch_per_read: f64,
+    mismatch_filtered_count: f64,
+    avg_read_length: f64,
 }
 
 impl Variant {
@@ -194,6 +198,10 @@ impl Variant {
         fwd_probability: f64,
         rev_probability: f64,
         local_entropy: f64,
+        read_end_filtered_count: f64,
+        avg_mismatch_per_read: f64,
+        mismatch_filtered_count: f64,
+        avg_read_length: f64,
     ) -> Self {
         Variant {
             contig,
@@ -225,6 +233,10 @@ impl Variant {
             fwd_probability,
             rev_probability,
             local_entropy,
+            read_end_filtered_count,
+            avg_mismatch_per_read,
+            mismatch_filtered_count,
+            avg_read_length,
         }
     }
 
@@ -257,7 +269,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMFR:AMFA:ABFR:ABFA:REDR:REDA:ISR:ISA:FWDP:REVP:LE\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMFR:AMFA:ABFR:ABFA:REDR:REDA:ISR:ISA:FWDP:REVP:LE:AMMR:MFC:ARL\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}:{:.1}:{:.1}:{:.1}:{:.1}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -307,6 +319,10 @@ impl Variant {
                 self.rev_probability
             },
             self.local_entropy,
+            self.read_end_filtered_count,
+            self.avg_mismatch_per_read,
+            self.mismatch_filtered_count,
+            self.avg_read_length,
         )
     }
 }
@@ -751,6 +767,10 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=REDA,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n\
 ##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Probability of the called genotype based on forward strand reads only\">\n\
 ##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Probability of the called genotype based on reverse strand reads only\">\n\
+##FORMAT=<ID=LE,Number=1,Type=Float,Description=\"Local sequence entropy\">\n\
+##FORMAT=<ID=AMMR,Number=1,Type=Float,Description=\"Average number of mismatches per read at the position\">\n\
+##FORMAT=<ID=MFC,Number=1,Type=Float,Description=\"Count of reads filtered due to mismatches at the position\">\n\
+##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
         contigs
     )
@@ -785,7 +805,6 @@ fn get_count_vec_candidates(
         let mut clears_filters = true;
         let variant = basecall.check_variant_type();
         let probability = right_tail_binomial_pval(total_depth, count as u64, error_rate);
-        println!("variant: {:?}, probability: {}", variant, probability);
         let pval_pass = probability >= right_tail_pval;
         match variant {
             VariantObservation::Snp
@@ -1042,7 +1061,7 @@ fn compute_pileup_counts(
     indel_filter_repeat_limit: usize,
     dinuc_cutoff: usize,
     mut tnc_error_rate: Option<&mut HashMap<TrinucleotideContext, (f64, f64)>>,  
-) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, u64) {
+) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, u64) {
     pileup_counts.fwd.clear();
     pileup_counts.rev.clear();
     pileup_counts.total.clear();
@@ -1062,15 +1081,20 @@ fn compute_pileup_counts(
     let mut ref_dist_from_read_end_count = 0;
     let mut alt_insert_size_sum = 0;
     let mut ref_insert_size_sum = 0;
-
-
+    let mut read_end_filtered_count_snps = 0;
+    let mut read_end_filtered_count_indels = 0;
+    let mut mismatch_filtered_count = 0;
+    let mut total_mismatches = 0;
+    let mut total_read_length = 0;
 
     for alignment in pileup.alignments() {
         let record = alignment.record();
         let mismatches = get_nm_tag(&record);
         if mismatches > max_mismatches {
-            continue;
+            mismatch_filtered_count += 1;
+            // continue;
         }
+        total_mismatches += mismatches;
 
         if let Some(qpos) = alignment.qpos() {
             let base = record.seq().as_bytes()[qpos] as char;
@@ -1129,6 +1153,7 @@ fn compute_pileup_counts(
             }
 
             let read_len = record.seq().len();
+            total_read_length += read_len as u64;
 
             if let Some(rates) = tnc_error_rate.as_mut() {
                 let left_flank = if ref_pos > 0 {
@@ -1167,11 +1192,14 @@ fn compute_pileup_counts(
             // Apply end-of-read cutoff for both passes (TNC estimation and calling).
             if variant_type == VariantObservation::Snp {
                 if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
-                    continue;
+                    read_end_filtered_count_snps += 1;
+                    // continue;
                 }
-            } else if qpos < indel_end_of_read_cutoff || qpos >= read_len - indel_end_of_read_cutoff
-            {
-                continue;
+            } else if variant_type == VariantObservation::Insertion || variant_type == VariantObservation::Deletion {
+                if qpos < indel_end_of_read_cutoff || qpos >= read_len - indel_end_of_read_cutoff {
+                    read_end_filtered_count_indels += 1;
+                    // continue;
+                }
             }
             let is_stranded_read_status = is_stranded_read(&record, stranded_read);
             if (record.is_reverse() && is_stranded_read_status)
@@ -1204,7 +1232,7 @@ fn compute_pileup_counts(
         }
     }
 
-    (ref_dist_from_read_end_count as f64, alt_dist_from_read_end_count as f64,  ref_insert_size_sum as f64, alt_insert_size_sum as f64, total_alt_counts as f64, total_ref_counts as f64, count_ref_mapq as f64, count_alt_mapq as f64, count_ref_bq as f64, count_alt_bq as f64, mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, indel_offset as u64)
+    (ref_dist_from_read_end_count as f64, alt_dist_from_read_end_count as f64,  ref_insert_size_sum as f64, alt_insert_size_sum as f64, total_alt_counts as f64, total_ref_counts as f64, count_ref_mapq as f64, count_alt_mapq as f64, count_ref_bq as f64, count_alt_bq as f64, mapq_filtered_ref as f64, mapq_filtered_alt as f64, bq_filtered_ref as f64, bq_filtered_alt as f64, read_end_filtered_count_snps as f64, read_end_filtered_count_indels as f64, mismatch_filtered_count as f64, total_mismatches as f64, total_read_length as f64, indel_offset as u64)
 }
 /// Main workflow for variant calling
 ///
@@ -1434,7 +1462,7 @@ fn compute_tnc_error_rates(
             indel_filter_repeat_limit
         };
 
-        let (ref_dist_from_read_end_count, alt_dist_from_read_end_count, ref_insert_size_sum, alt_insert_size_sum, total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq, count_alt_bq, mapq_filtered_ref, mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, indel_offset) = compute_pileup_counts(
+        let (ref_dist_from_read_end_count, alt_dist_from_read_end_count, ref_insert_size_sum, alt_insert_size_sum, total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq, count_alt_bq, mapq_filtered_ref, mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, read_end_filtered_count_snps, read_end_filtered_count_indels, mismatch_filtered_count, total_mismatches, total_read_length, indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1646,7 +1674,7 @@ fn call_variants(
             indel_filter_repeat_limit
         };
 
-        let (ref_dist_from_read_end_count, alt_dist_from_read_end_count, ref_insert_size_sum, alt_insert_size_sum, total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq, count_alt_bq, mapq_filtered_ref, mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, indel_offset) = compute_pileup_counts(
+        let (ref_dist_from_read_end_count, alt_dist_from_read_end_count, ref_insert_size_sum, alt_insert_size_sum, total_alt_counts, total_ref_counts, count_ref_mapq , count_alt_mapq , count_ref_bq, count_alt_bq, mapq_filtered_ref, mapq_filtered_alt, bq_filtered_ref, bq_filtered_alt, read_end_filtered_count_snps, read_end_filtered_count_indels, mismatch_filtered_count, total_mismatches, total_read_length, indel_offset) = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1699,6 +1727,16 @@ fn call_variants(
         };
         let avg_alt_insert_size = if alt_insert_size_sum > 0.0 && total_alt_counts > 0.0 {
             alt_insert_size_sum / total_alt_counts as f64
+        } else {
+            0.0
+        };
+        let avg_mismatch_per_read = if total_mismatches > 0.0 && (total_ref_counts + total_alt_counts) > 0.0 {
+            total_mismatches / (total_ref_counts + total_alt_counts) as f64
+        } else {
+            0.0
+        };
+        let avg_read_length = if total_read_length > 0.0 && (total_ref_counts + total_alt_counts) > 0.0 {
+            total_read_length / (total_ref_counts + total_alt_counts) as f64
         } else {
             0.0
         };
@@ -1816,9 +1854,9 @@ fn call_variants(
         if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
             for candidate in candidate_snps {
                 let alt_counts = counts_snps.get(&candidate).unwrap_or(&0);
-                if *alt_counts < min_ao as usize {
-                    continue;
-                }
+                // if *alt_counts < min_ao as usize {
+                //     continue;
+                // }
                 let (genotype, is_somatic) = assign_genotype(*alt_counts, total_depth as usize, tnc_error_rate);
 
                 let variant = Variant::new(
@@ -1851,6 +1889,10 @@ fn call_variants(
                     forward_strand_bias_snps,
                     reverse_strand_bias_snps,
                     local_entropy,
+                    read_end_filtered_count_snps,
+                    avg_mismatch_per_read,
+                    mismatch_filtered_count,
+                    avg_read_length,
                 );
                 variants.push(variant);
             }
@@ -1894,6 +1936,10 @@ fn call_variants(
                     forward_strand_bias_indels,
                     reverse_strand_bias_indels,
                     local_entropy,
+                    read_end_filtered_count_indels,
+                    avg_mismatch_per_read,
+                    mismatch_filtered_count,
+                    avg_read_length,
                 );
                 variants.push(variant);
             }
