@@ -257,7 +257,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:REDR:REDA:ISR:ISA:FWD:REV:LE\t{}:{}:{}:{:.3e}:{}{}{}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}:{:.3e}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMFR:AMFA:ABFR:ABFA:REDR:REDA:ISR:ISA:FWDP:REVP:LE\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -279,7 +279,11 @@ impl Variant {
             self.tnc.upstream_base as char,
             self.tnc.ref_base as char,
             self.tnc.downstream_base as char,
-            self.probability,
+            if self.probability == 0.0 {
+                1e-300
+            } else {
+                self.probability
+            },
             self.mapq_filtered_ref,
             self.mapq_filtered_alt,
             self.bq_filtered_ref,
@@ -292,8 +296,16 @@ impl Variant {
             self.avg_alt_dist_from_read_end,
             self.avg_ref_insert_size,
             self.avg_alt_insert_size,
-            self.fwd_probability,
-            self.rev_probability,
+            if self.fwd_probability == 0.0 {
+                1e-300
+            } else {
+                self.fwd_probability
+            },
+            if self.rev_probability == 0.0 {
+                1e-300
+            } else {
+                self.rev_probability
+            },
             self.local_entropy,
         )
     }
@@ -725,7 +737,6 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##INFO=<ID=CD,Number=1,Type=String,Description=\"TVC Call Directive\">\n\
 ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
 ##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n\
-##FORMAT=<ID=RO,Number=1,Type=Integer,Description=\"Reference Allele Count\">\n\
 ##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n\
 ##FORMAT=<ID=ER,Number=1,Type=Float,Description=\"Estimated Error Rate\">\n\
 ##FORMAT=<ID=TNC,Number=3,Type=String,Description=\"Trinucleotide Context (upstream,ref,downstream)\">\n\
@@ -734,10 +745,12 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=MFA,Number=1,Type=Float,Description=\"Mean mapping quality of reads supporting the alternate allele\">\n\
 ##FORMAT=<ID=BFR,Number=1,Type=Float,Description=\"Mean base quality of reads supporting the reference allele\">\n\
 ##FORMAT=<ID=BFA,Number=1,Type=Float,Description=\"Mean base quality of reads supporting the alternate allele\">\n\
-##FORMAT=<ID=ARDE,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the reference allele\">\n\
-##FORMAT=<ID=AADE,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n
-##FORMAT=<ID=ARIS,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n\
-##FORMAT=<ID=AAIS,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n\
+##FORMAT=<ID=ISA,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n\
+##FORMAT=<ID=ISR,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n\
+##FORMAT=<ID=REDR,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the reference allele\">\n\
+##FORMAT=<ID=REDA,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n\
+##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Probability of the called genotype based on forward strand reads only\">\n\
+##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Probability of the called genotype based on reverse strand reads only\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
         contigs
     )
@@ -772,6 +785,7 @@ fn get_count_vec_candidates(
         let mut clears_filters = true;
         let variant = basecall.check_variant_type();
         let probability = right_tail_binomial_pval(total_depth, count as u64, error_rate);
+        println!("variant: {:?}, probability: {}", variant, probability);
         let pval_pass = probability >= right_tail_pval;
         match variant {
             VariantObservation::Snp
@@ -964,7 +978,13 @@ impl TrinucleotideContext {
     }
 }
 }
-
+/// Calculate Shannon entropy of a sequence
+/// Returns 0 for empty sequences, and is based on the frequency of A, C, G, T
+/// Non-ACGT characters are ignored in the calculation
+/// The formula is: -sum(p_i * log2(p_i)) for each base i, where p_i is the frequency of base i in the sequence
+/// The entropy is measured in bits, and higher values indicate more diversity in the sequence
+/// The maximum entropy for a sequence of A, C, G, T is 2 bits (when all bases are equally represented)
+/// For example, the sequence "ACGT" has an entropy of 2 bits, while "AAAA" has an entropy of 0 bits
 fn shannon_entropy(sequence: &[u8]) -> f64 {
     if sequence.is_empty() {
         return 0.0;
@@ -977,7 +997,7 @@ fn shannon_entropy(sequence: &[u8]) -> f64 {
             b'C' | b'c' => counts[1] += 1,
             b'G' | b'g' => counts[2] += 1,
             b'T' | b't' => counts[3] += 1,
-            _ => {}  // skip N and anything else
+            _ => {} 
         }
         valid += 1;
     }
@@ -1490,6 +1510,7 @@ fn compute_tnc_error_rates(
             &r_one_r_probabilities_snps,
             &total_probabilities_snps,
         );
+
         let total_ref_snps: u64 = counts_snps
             .iter()
             .filter(|(k, _)| k.check_variant_type() == VariantObservation::Ref)
@@ -1737,7 +1758,7 @@ fn call_variants(
             get_count_vec_candidates(&total_counts_snps, tnc_error_rate, right_tail_pval);
         let (total_candidates_indels, total_probabilities_indels, total_pval_pass_indels) =
             get_count_vec_candidates(&total_counts_indels, tnc_error_rate, right_tail_pval);
-        
+
         let directive_snps = find_where_to_call_variants(
             ref_base as char,
             &r_one_f_candidates_snps,
@@ -1988,8 +2009,10 @@ mod tests {
                 if variants.is_empty() {
                     println!("Warning: No variants called");
                 }
-                println!("Called variants: {:?}", variants);
-
+                for v in &variants {
+                    let variant = v.to_vcf();
+                    println!("{}", variant);
+                }
                 let matching_variant = variants
                     .iter()
                     .find(|v| v.pos == $pos)
