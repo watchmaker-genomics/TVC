@@ -272,7 +272,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMFR:AMFA:ABFR:ABFA:REDR:REDA:ISR:ISA:FWDP:REVP:LLE:SLE:AMMR:MFC:ARL\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMQR:AMQA:ABQR:ABQA:REDR:REDA:ISR:ISA:FWDP:REVP:LLE:SLE:REFC:AMPR:MFC:ARL\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -761,19 +761,24 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=ER,Number=1,Type=Float,Description=\"Estimated Error Rate\">\n\
 ##FORMAT=<ID=TNC,Number=3,Type=String,Description=\"Trinucleotide Context (upstream,ref,downstream)\">\n\
 ##FORMAT=<ID=PR,Number=1,Type=Float,Description=\"Probability of the called genotype\">\n\
-##FORMAT=<ID=MFR,Number=1,Type=Float,Description=\"Mean mapping quality of reads supporting the reference allele\">\n\
-##FORMAT=<ID=MFA,Number=1,Type=Float,Description=\"Mean mapping quality of reads supporting the alternate allele\">\n\
-##FORMAT=<ID=BFR,Number=1,Type=Float,Description=\"Mean base quality of reads supporting the reference allele\">\n\
-##FORMAT=<ID=BFA,Number=1,Type=Float,Description=\"Mean base quality of reads supporting the alternate allele\">\n\
-##FORMAT=<ID=ISA,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n\
-##FORMAT=<ID=ISR,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n\
+##FORMAT=<ID=MFR,Number=1,Type=Float,Description=\"Count of reference-supporting reads filtered by mapping quality\">\n\
+##FORMAT=<ID=MFA,Number=1,Type=Float,Description=\"Count of alternate-supporting reads filtered by mapping quality\">\n\
+##FORMAT=<ID=BFR,Number=1,Type=Float,Description=\"Count of reference-supporting reads filtered by base quality\">\n\
+##FORMAT=<ID=BFA,Number=1,Type=Float,Description=\"Count of alternate-supporting reads filtered by base quality\">\n\
+##FORMAT=<ID=AMQR,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the reference allele\">\n\
+##FORMAT=<ID=AMQA,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the alternate allele\">\n\
+##FORMAT=<ID=ABQR,Number=1,Type=Float,Description=\"Average base quality of reads supporting the reference allele\">\n\
+##FORMAT=<ID=ABQA,Number=1,Type=Float,Description=\"Average base quality of reads supporting the alternate allele\">\n\
 ##FORMAT=<ID=REDR,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the reference allele\">\n\
 ##FORMAT=<ID=REDA,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n\
+##FORMAT=<ID=ISR,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n\
+##FORMAT=<ID=ISA,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n\
 ##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Probability of the called genotype based on forward strand reads only\">\n\
 ##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Probability of the called genotype based on reverse strand reads only\">\n\
-##FORMAT=<ID=LLE,Number=1,Type=Float,Description=\"Large Local sequence entropy (50 bp on either side)\">\n\
+##FORMAT=<ID=LLE,Number=1,Type=Float,Description=\"Large local sequence entropy (50 bp on either side)\">\n\
 ##FORMAT=<ID=SLE,Number=1,Type=Float,Description=\"Small local sequence entropy (15 bp on either side)\">\n\
-##FORMAT=<ID=AMMR,Number=1,Type=Float,Description=\"Average number of mismatches per read at the position\">\n\
+##FORMAT=<ID=REFC,Number=1,Type=Float,Description=\"Count of reads filtered due to proximity to read ends\">\n\
+##FORMAT=<ID=AMPR,Number=1,Type=Float,Description=\"Average mismatches per read at the position\">\n\
 ##FORMAT=<ID=MFC,Number=1,Type=Float,Description=\"Count of reads filtered due to mismatches at the position\">\n\
 ##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
