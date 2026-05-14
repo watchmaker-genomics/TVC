@@ -66,10 +66,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            artifact_suffix: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_suffix: -static
           - os: macos-latest
             target: x86_64-apple-darwin
+            artifact_suffix: ""
           - os: macos-latest
             target: aarch64-apple-darwin
+            artifact_suffix: ""
 
     steps:
       - name: Checkout code
@@ -87,22 +93,40 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify static linkage (musl only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          file target/${{ matrix.target }}/release/tvc
+          ldd target/${{ matrix.target }}/release/tvc || true
+          if objdump -T target/${{ matrix.target }}/release/tvc 2>/dev/null | grep -q GLIBC; then
+            echo "ERROR: binary has GLIBC symbol references"
+            exit 1
+          fi
+          echo "OK: no GLIBC references"
 
       - name: Package binary
         run: |
           mkdir -p release
           cp target/${{ matrix.target }}/release/tvc release/tvc
-          tar -czf tvc-${{ matrix.target }}.tar.gz -C release tvc
+          tar -czf tvc-${{ matrix.target }}${{ matrix.artifact_suffix }}.tar.gz -C release tvc
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tvc-${{ matrix.target }}
-          path: tvc-${{ matrix.target }}.tar.gz
+          name: tvc-${{ matrix.target }}${{ matrix.artifact_suffix }}
+          path: tvc-${{ matrix.target }}${{ matrix.artifact_suffix }}.tar.gz
 
 
 # ======================
@@ -180,6 +204,13 @@ jobs:
           name: tvc-x86_64-unknown-linux-gnu
           path: ./artifacts/linux
 
+      # Download Linux static (musl) artifact
+      - name: Download Linux static (musl) artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tvc-x86_64-unknown-linux-musl-static
+          path: ./artifacts/linux-static
+
       # Download macOS x86_64 artifact
       - name: Download macOS x86_64 artifact
         uses: actions/download-artifact@v4
@@ -200,6 +231,7 @@ jobs:
         with:
           files: |
             ./artifacts/linux/**/*.tar.gz
+            ./artifacts/linux-static/**/*.tar.gz
             ./artifacts/macos-x86_64/**/*.tar.gz
             ./artifacts/macos-arm/**/*.tar.gz
         env:
