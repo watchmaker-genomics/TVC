@@ -132,59 +132,61 @@ jobs:
 # ======================
 # Build and Push Multi-Arch Docker Image to Public ECR
 # ======================
-  build-and-push:
-    needs: [test]   # Only run after tests pass
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/ci_testing'
-
-    env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      PUBLIC_REPO_ID: e5r9o8m6        # Replace with your public ECR ID
-      ECR_REPOSITORY: watchmakergenomics/tvc
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      # Extract version or branch name
-      - name: Extract version or branch name
-        id: tag
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
-          else
-            echo "RELEASE_TAG=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_ENV
-          fi
-
-      # Configure AWS credentials
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      # Log in to Amazon ECR Public
-      - name: Log in to Amazon ECR Public
-        run: |
-          aws ecr-public get-login-password --region us-east-1 | \
-          docker login --username AWS --password-stdin public.ecr.aws/${{ env.PUBLIC_REPO_ID }}
-
-      # Set up Docker Buildx
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Build and push multi-arch Docker image
-      - name: Build and Push Docker image to Public ECR
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: linux/amd64
-          tags: |
-            public.ecr.aws/${{ env.PUBLIC_REPO_ID }}/${{ env.ECR_REPOSITORY }}:latest
-            public.ecr.aws/${{ env.PUBLIC_REPO_ID }}/${{ env.ECR_REPOSITORY }}:${{ env.RELEASE_TAG }}
+# TEMPORARILY DISABLED for musl static-binary CI dry-run on ci_testing.
+# Revert this commit before merging to main.
+#  build-and-push:
+#    needs: [test]   # Only run after tests pass
+#    runs-on: ubuntu-latest
+#    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/ci_testing'
+#
+#    env:
+#      AWS_REGION: ${{ secrets.AWS_REGION }}
+#      PUBLIC_REPO_ID: e5r9o8m6        # Replace with your public ECR ID
+#      ECR_REPOSITORY: watchmakergenomics/tvc
+#
+#    steps:
+#      - name: Checkout code
+#        uses: actions/checkout@v4
+#
+#      # Extract version or branch name
+#      - name: Extract version or branch name
+#        id: tag
+#        run: |
+#          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+#            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+#          else
+#            echo "RELEASE_TAG=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_ENV
+#          fi
+#
+#      # Configure AWS credentials
+#      - name: Configure AWS credentials
+#        uses: aws-actions/configure-aws-credentials@v4
+#        with:
+#          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#          aws-region: ${{ secrets.AWS_REGION }}
+#
+#      # Log in to Amazon ECR Public
+#      - name: Log in to Amazon ECR Public
+#        run: |
+#          aws ecr-public get-login-password --region us-east-1 | \
+#          docker login --username AWS --password-stdin public.ecr.aws/${{ env.PUBLIC_REPO_ID }}
+#
+#      # Set up Docker Buildx
+#      - name: Set up Docker Buildx
+#        uses: docker/setup-buildx-action@v3
+#
+#      # Build and push multi-arch Docker image
+#      - name: Build and Push Docker image to Public ECR
+#        uses: docker/build-push-action@v6
+#        with:
+#          context: .
+#          file: ./Dockerfile
+#          push: true
+#          platforms: linux/amd64
+#          tags: |
+#            public.ecr.aws/${{ env.PUBLIC_REPO_ID }}/${{ env.ECR_REPOSITORY }}:latest
+#            public.ecr.aws/${{ env.PUBLIC_REPO_ID }}/${{ env.ECR_REPOSITORY }}:${{ env.RELEASE_TAG }}
 
 
 
@@ -192,7 +194,7 @@ jobs:
   #  Create GitHub Release (only for tags)
   # ======================
   release:
-    needs: [build-binaries, build-and-push]
+    needs: [build-binaries]  # build-and-push temporarily removed for ci_testing dry run
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
 
