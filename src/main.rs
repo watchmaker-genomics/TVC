@@ -150,6 +150,9 @@ struct Variant {
     avg_mismatch_per_read: f64,
     mismatch_filtered_count: f64,
     avg_read_length: f64,
+    forward_strand_count_snps: f64,
+    reverse_strand_count_snps: f64,
+    both_strands_count_snps: f64,
 }
 
 impl Variant {
@@ -204,6 +207,9 @@ impl Variant {
         avg_mismatch_per_read: f64,
         mismatch_filtered_count: f64,
         avg_read_length: f64,
+        forward_strand_count_snps: f64,
+        reverse_strand_count_snps: f64,
+        both_strands_count_snps: f64,
     ) -> Self {
         Variant {
             contig,
@@ -240,6 +246,9 @@ impl Variant {
             avg_mismatch_per_read,
             mismatch_filtered_count,
             avg_read_length,
+            forward_strand_count_snps,
+            reverse_strand_count_snps,
+            both_strands_count_snps,
         }
     }
 
@@ -272,7 +281,7 @@ impl Variant {
         let variant_type = self.infer_variant_type();
 
         format!(
-            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMQR:AMQA:ABQR:ABQA:REDR:REDA:ISR:ISA:FWDP:REVP:LLE:SLE:REFC:AMPR:MFC:ARL\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}\n",
+            "{}\t{}\t.\t{}\t{}\t{}\t.\tVT={};CD={}\tGT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMQR:AMQA:ABQR:ABQA:REDR:REDA:ISR:ISA:FWDP:REVP:LLE:SLE:REFC:AMPR:MFC:ARL:FWD:REV:TOT\t{}:{}:{}:{:.3E}:{}{}{}:{:.3E}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.3E}:{:.3E}:{:.3}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}:{:.1}\n",
             self.contig,
             self.pos,
             self.reference,
@@ -327,6 +336,9 @@ impl Variant {
             self.avg_mismatch_per_read,
             self.mismatch_filtered_count,
             self.avg_read_length,
+            self.forward_strand_count_snps,
+            self.reverse_strand_count_snps,
+            self.both_strands_count_snps,
         )
     }
 }
@@ -781,6 +793,9 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=AMPR,Number=1,Type=Float,Description=\"Average mismatches per read at the position\">\n\
 ##FORMAT=<ID=MFC,Number=1,Type=Float,Description=\"Count of reads filtered due to mismatches at the position\">\n\
 ##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n\
+##FORMAT=<ID=FWD,Number=1,Type=Float,Description=\"Forward counts\">\n\
+##FORMAT=<ID=REV,Number=1,Type=Float,Description=\"Reverse counts\">\n\
+####FORMAT=<ID=TOT,Number=1,Type=Float,Description=\"Both strand counts\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
         contigs
     )
@@ -1859,12 +1874,18 @@ fn call_variants(
         let combined_total = (fwd_prob_sum + rev_prob_sum).max(1e-10);
         let forward_strand_bias_snps = fwd_prob_sum / combined_total;
         let reverse_strand_bias_snps = rev_prob_sum / combined_total;
+        let forward_strand_count_snps = r_one_f_counts_snps.values().sum::<usize>() as f64;
+        let reverse_strand_count_snps = r_one_r_counts_snps.values().sum::<usize>() as f64;
+        let both_strands_count_snps = total_counts_snps.values().sum::<usize>() as f64; 
 
         let fwd_prob_sum_indels = r_one_f_probabilities_indels.iter().sum::<f64>();
         let rev_prob_sum_indels = r_one_r_probabilities_indels.iter().sum::<f64>();
         let combined_total_indels = (fwd_prob_sum_indels + rev_prob_sum_indels).max(1e-10);
         let forward_strand_bias_indels = fwd_prob_sum_indels / combined_total_indels;
         let reverse_strand_bias_indels = rev_prob_sum_indels / combined_total_indels;
+        let forward_strand_counts_indels = r_one_f_counts_indels.values().sum::<usize>() as f64;
+        let reverse_strand_counts_indels = r_one_r_counts_indels.values().sum::<usize>() as f64;
+        let total_counts_indels = total_counts_indels.values().sum::<usize>() as f64;
 
         if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
             for candidate in candidate_snps {
@@ -1909,6 +1930,9 @@ fn call_variants(
                     avg_mismatch_per_read,
                     mismatch_filtered_count,
                     avg_read_length,
+                    forward_strand_count_snps,
+                    reverse_strand_count_snps,
+                    both_strands_count_snps,
                 );
                 variants.push(variant);
             }
@@ -1957,6 +1981,9 @@ fn call_variants(
                     avg_mismatch_per_read,
                     mismatch_filtered_count,
                     avg_read_length,
+                    forward_strand_counts_indels,
+                    reverse_strand_counts_indels,
+                    total_counts_indels,
                 );
                 variants.push(variant);
             }
