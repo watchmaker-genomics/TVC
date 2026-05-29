@@ -795,7 +795,7 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n\
 ##FORMAT=<ID=FWD,Number=1,Type=Float,Description=\"Forward counts\">\n\
 ##FORMAT=<ID=REV,Number=1,Type=Float,Description=\"Reverse counts\">\n\
-####FORMAT=<ID=TOT,Number=1,Type=Float,Description=\"Both strand counts\">\n\
+##FORMAT=<ID=TOT,Number=1,Type=Float,Description=\"Both strand counts\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
         contigs
     )
