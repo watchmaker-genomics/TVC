@@ -16,11 +16,36 @@ use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use tracing::info;
+
+const MODEL_PATH_PLACEHOLDER: &str = "model.onnx";
+const MODEL_PROBABILITY_THRESHOLD: f64 = 0.3;
+const MODEL_TNC_BASES: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
+const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
+
+// IMPORTANT: This must match the exported ONNX model input column order.
+// It mirrors the Python training script: NUMERIC_FEATURES + engineered terms
+// + one-hot categorical dummies.
+const MODEL_FEATURE_ORDER: [&str; 53] = [
+    "DP", "AO", "ER", "PR",
+    "MFR", "MFA", "BFR", "BFA",
+    "AMQR", "AMQA", "ABQR", "ABQA",
+    "REDR", "REDA", "ISR", "ISA",
+    "FWDP", "REVP", "LLE", "SLE",
+    "REFC", "AMPR", "MFC", "ARL",
+    "FWD", "REV", "TOT",
+    "AF", "MQ_diff", "BQ_diff", "RED_diff", "IS_diff", "strand_bias",
+    "TNC_up_A", "TNC_up_C", "TNC_up_G", "TNC_up_T", "TNC_up_N",
+    "TNC_ref_A", "TNC_ref_C", "TNC_ref_G", "TNC_ref_T", "TNC_ref_N",
+    "TNC_down_A", "TNC_down_C", "TNC_down_G", "TNC_down_T", "TNC_down_N",
+    "VT_COMPLEX", "VT_DEL", "VT_INS", "VT_MNP", "VT_SNP",
+];
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum ReadNumber {
@@ -87,7 +112,7 @@ struct Args {
     #[arg(short = 'p', long, default_value_t = 0.005)]
     error_rate: f64,
 
-    #[arg(short = 'h', long, default_value_t = 3)]
+    #[arg(short = 'f', long, default_value_t = 3)]
     indel_filter_repeat_limit: usize,
 
     #[arg(short = 'r', long, value_enum, default_value_t = ReadNumber::R1)]
@@ -833,6 +858,227 @@ fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype
     Genotype::new(gt, best_prob, total)
 }
 
+fn infer_variant_type_from_alleles(reference: &str, alt: &str) -> &'static str {
+    let rlen = reference.len();
+    let alen = alt.len();
+    match (rlen, alen) {
+        (1, 1) => "SNP",
+        (r, a) if r > 1 && a > 1 && r == a => "MNP",
+        (r, 1) if r > 1 => "DEL",
+        (1, a) if a > 1 => "INS",
+        _ => "COMPLEX",
+    }
+}
+
+#[derive(Debug)]
+struct ModelInferenceConfig {
+    model_path: String,
+    threshold: f64,
+    model_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ModelFeatureInputs {
+    depth: f64,
+    alt_counts: f64,
+    error_rate: f64,
+    caller_probability: f64,
+    mapq_filtered_ref: f64,
+    mapq_filtered_alt: f64,
+    bq_filtered_ref: f64,
+    bq_filtered_alt: f64,
+    average_ref_mapq: f64,
+    average_alt_mapq: f64,
+    average_ref_bq: f64,
+    average_alt_bq: f64,
+    avg_ref_dist: f64,
+    avg_alt_dist: f64,
+    avg_ref_ins: f64,
+    avg_alt_ins: f64,
+    fwd_probability: f64,
+    rev_probability: f64,
+    large_entropy: f64,
+    small_entropy: f64,
+    read_end_filtered_count: f64,
+    avg_mismatch_per_read: f64,
+    mismatch_filtered_count: f64,
+    avg_read_length: f64,
+    fwd_count: f64,
+    rev_count: f64,
+    total_count: f64,
+    tnc_up: char,
+    tnc_ref: char,
+    tnc_down: char,
+    vt: &'static str,
+}
+
+fn model_inference_config() -> &'static ModelInferenceConfig {
+    static CONFIG: OnceLock<ModelInferenceConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let model_path = MODEL_PATH_PLACEHOLDER.to_string();
+        let model_exists = Path::new(&model_path).exists();
+
+        if model_exists {
+            info!(
+                "Detected ONNX model at {}. Inference hook is active and can be swapped to runtime execution.",
+                model_path
+            );
+        } else {
+            info!(
+                "No ONNX model found at {}. Falling back to placeholder scoring.",
+                model_path
+            );
+        }
+
+        ModelInferenceConfig {
+            model_path,
+            threshold: MODEL_PROBABILITY_THRESHOLD,
+            model_exists,
+        }
+    })
+}
+
+/// Build model input features in a stable order.
+///
+/// IMPORTANT: keep the order in sync with model training.
+fn build_model_feature_vector(inputs: &ModelFeatureInputs) -> Vec<f32> {
+    let af = if inputs.depth > 0.0 {
+        inputs.alt_counts / inputs.depth
+    } else {
+        0.0
+    };
+    let mq_diff = inputs.average_alt_mapq - inputs.average_ref_mapq;
+    let bq_diff = inputs.average_alt_bq - inputs.average_ref_bq;
+    let red_diff = inputs.avg_alt_dist - inputs.avg_ref_dist;
+    let is_diff = inputs.avg_alt_ins - inputs.avg_ref_ins;
+    let strand_bias = (inputs.fwd_probability - inputs.rev_probability).abs();
+
+    let mut values = HashMap::<&str, f64>::new();
+    values.insert("DP", inputs.depth);
+    values.insert("AO", inputs.alt_counts);
+    values.insert("ER", inputs.error_rate);
+    values.insert("PR", inputs.caller_probability);
+    values.insert("MFR", inputs.mapq_filtered_ref);
+    values.insert("MFA", inputs.mapq_filtered_alt);
+    values.insert("BFR", inputs.bq_filtered_ref);
+    values.insert("BFA", inputs.bq_filtered_alt);
+    values.insert("AMQR", inputs.average_ref_mapq);
+    values.insert("AMQA", inputs.average_alt_mapq);
+    values.insert("ABQR", inputs.average_ref_bq);
+    values.insert("ABQA", inputs.average_alt_bq);
+    values.insert("REDR", inputs.avg_ref_dist);
+    values.insert("REDA", inputs.avg_alt_dist);
+    values.insert("ISR", inputs.avg_ref_ins);
+    values.insert("ISA", inputs.avg_alt_ins);
+    values.insert("FWDP", inputs.fwd_probability);
+    values.insert("REVP", inputs.rev_probability);
+    values.insert("LLE", inputs.large_entropy);
+    values.insert("SLE", inputs.small_entropy);
+    values.insert("REFC", inputs.read_end_filtered_count);
+    values.insert("AMPR", inputs.avg_mismatch_per_read);
+    values.insert("MFC", inputs.mismatch_filtered_count);
+    values.insert("ARL", inputs.avg_read_length);
+    values.insert("FWD", inputs.fwd_count);
+    values.insert("REV", inputs.rev_count);
+    values.insert("TOT", inputs.total_count);
+    values.insert("AF", af);
+    values.insert("MQ_diff", mq_diff);
+    values.insert("BQ_diff", bq_diff);
+    values.insert("RED_diff", red_diff);
+    values.insert("IS_diff", is_diff);
+    values.insert("strand_bias", strand_bias);
+
+    let up = inputs.tnc_up.to_ascii_uppercase();
+    let rf = inputs.tnc_ref.to_ascii_uppercase();
+    let dn = inputs.tnc_down.to_ascii_uppercase();
+    for base in MODEL_TNC_BASES {
+        values.insert(
+            match base {
+                'A' => "TNC_up_A",
+                'C' => "TNC_up_C",
+                'G' => "TNC_up_G",
+                'T' => "TNC_up_T",
+                _ => "TNC_up_N",
+            },
+            if up == base { 1.0 } else { 0.0 },
+        );
+        values.insert(
+            match base {
+                'A' => "TNC_ref_A",
+                'C' => "TNC_ref_C",
+                'G' => "TNC_ref_G",
+                'T' => "TNC_ref_T",
+                _ => "TNC_ref_N",
+            },
+            if rf == base { 1.0 } else { 0.0 },
+        );
+        values.insert(
+            match base {
+                'A' => "TNC_down_A",
+                'C' => "TNC_down_C",
+                'G' => "TNC_down_G",
+                'T' => "TNC_down_T",
+                _ => "TNC_down_N",
+            },
+            if dn == base { 1.0 } else { 0.0 },
+        );
+    }
+
+    let vt = inputs.vt;
+    for vt_value in MODEL_VT_VALUES {
+        values.insert(
+            match vt_value {
+                "COMPLEX" => "VT_COMPLEX",
+                "DEL" => "VT_DEL",
+                "INS" => "VT_INS",
+                "MNP" => "VT_MNP",
+                _ => "VT_SNP",
+            },
+            if vt == vt_value { 1.0 } else { 0.0 },
+        );
+    }
+
+    MODEL_FEATURE_ORDER
+        .iter()
+        .map(|k| values.get(*k).copied().unwrap_or(0.0) as f32)
+        .collect()
+}
+
+/// Placeholder ONNX inference hook.
+///
+/// Replace this function body with your ONNX runtime call. The signature and
+/// call sites are already wired so you can plug inference in one place.
+fn run_onnx_inference_placeholder(
+    _model_path: &str,
+    features: &[f32],
+) -> Result<f64, Box<dyn std::error::Error>> {
+    if features.len() < 2 {
+        return Err("Feature vector must contain at least DP and AO".into());
+    }
+
+    // Temporary proxy score based on allele fraction.
+    let depth = features[0] as f64;
+    let alt_counts = features[1] as f64;
+    let probability = if depth > 0.0 { alt_counts / depth } else { 0.0 };
+
+    Ok(probability.clamp(0.0, 1.0))
+}
+
+fn model_probability_score(config: &ModelInferenceConfig, features: &[f32]) -> f64 {
+    if config.model_exists {
+        match run_onnx_inference_placeholder(&config.model_path, features) {
+            Ok(probability) => probability,
+            Err(_) => {
+                // If runtime inference fails, do not drop calls silently.
+                1.0
+            }
+        }
+    } else {
+        // No model file yet: keep baseline caller behavior (no ML filtering).
+        1.0
+    }
+}
+
 /// Retrieve an NM tag from a record
 ///
 /// # Arguments
@@ -1307,7 +1553,23 @@ pub fn workflow(
 
     Ok(())
 }
-
+/// Compute trinucleotide context-specific error rates for a genome chunk
+///
+/// # Arguments
+/// * `chunk` - The genome chunk to analyze
+/// * `bam_path` - Path to the BAM file
+/// * `ref_seq` - The reference sequence for the chunk
+/// * `min_bq` - Minimum base quality
+/// * `min_mapq` - Minimum mapping quality
+/// * `min_depth` - Minimum read depth
+/// * `end_of_read_cutoff` - End of read cutoff for SNPs
+/// * `indel_end_of_read_cutoff` - End of read cutoff for indels
+/// * `max_mismatches` - Maximum allowed mismatches in a read
+/// * `error_rate` - Expected general error rate
+/// * `stranded_read` - Which read is stranded (R1 or R2)
+/// * `indel_filter_repeat_limit` - Number of bases for homopolymer/dinucleotide repeat filtering for indels
+/// # Returns
+/// A HashMap mapping each trinucleotide context to its estimated error rate
 fn compute_tnc_error_rates(
     chunk: &GenomeChunk,
     bam_path: &str,
@@ -1462,6 +1724,8 @@ fn call_variants(
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
+    let model_config = model_inference_config();
+
     let error_map = compute_tnc_error_rates(
         chunk, bam_path, ref_seq, min_bq, min_mapq, min_depth,
         end_of_read_cutoff, indel_end_of_read_cutoff, max_mismatches,
@@ -1494,9 +1758,9 @@ fn call_variants(
         let pos = pileup.pos();
         let ref_base = ref_seq[pos as usize];
 
-        if pileup.depth() < min_depth {
-            continue;
-        }
+        // if pileup.depth() < min_depth {
+        //     continue;
+        // }
 
         let dinuc_cutoff = if !indel_filter_repeat_limit.is_multiple_of(2) {
             indel_filter_repeat_limit + 1
@@ -1605,11 +1869,52 @@ fn call_variants(
         if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
             for candidate in candidate_snps {
                 let alt_counts = *counts_snps.get(&candidate).unwrap_or(&0);
+                let ref_allele = candidate.get_reference_allele();
+                let alt_allele = candidate.get_alternate_allele();
+                let vt = infer_variant_type_from_alleles(&ref_allele, &alt_allele);
+                let model_inputs = ModelFeatureInputs {
+                    depth: total_depth as f64,
+                    alt_counts: alt_counts as f64,
+                    error_rate: tnc_er,
+                    caller_probability: prob_snps,
+                    mapq_filtered_ref: s.mapq_filtered_ref,
+                    mapq_filtered_alt: s.mapq_filtered_alt,
+                    bq_filtered_ref: s.bq_filtered_ref,
+                    bq_filtered_alt: s.bq_filtered_alt,
+                    average_ref_mapq,
+                    average_alt_mapq,
+                    average_ref_bq,
+                    average_alt_bq,
+                    avg_ref_dist,
+                    avg_alt_dist,
+                    avg_ref_ins,
+                    avg_alt_ins,
+                    fwd_probability: fwd_bias,
+                    rev_probability: rev_bias,
+                    large_entropy,
+                    small_entropy,
+                    read_end_filtered_count: s.read_end_filtered_count_snps,
+                    avg_mismatch_per_read: avg_mismatch,
+                    mismatch_filtered_count: s.mismatch_filtered_count,
+                    avg_read_length,
+                    fwd_count: fwd_count_snps,
+                    rev_count: rev_count_snps,
+                    total_count: both_count_snps,
+                    tnc_up: upstream as char,
+                    tnc_ref: ref_base as char,
+                    tnc_down: downstream as char,
+                    vt,
+                };
+                let model_features = build_model_feature_vector(&model_inputs);
+                let model_probability = model_probability_score(model_config, &model_features);
+                if model_probability <= model_config.threshold {
+                    continue;
+                }
                 let genotype = assign_genotype(alt_counts, total_depth as usize, tnc_er);
 
                 variants.push(Variant::new(
                     ref_name.to_string(), pos + 1,
-                    candidate.get_reference_allele(), candidate.get_alternate_allele(),
+                    ref_allele, alt_allele,
                     genotype.genotype, genotype.score,
                     total_depth as u32, alt_counts as u32,
                     directive_snps.clone(), tnc_er, ctx.clone(),
@@ -1631,11 +1936,52 @@ fn call_variants(
                 if alt_counts < min_ao as usize {
                     continue;
                 }
+                let ref_allele = candidate.get_reference_allele();
+                let alt_allele = candidate.get_alternate_allele();
+                let vt = infer_variant_type_from_alleles(&ref_allele, &alt_allele);
+                let model_inputs = ModelFeatureInputs {
+                    depth: total_depth_filtered as f64,
+                    alt_counts: alt_counts as f64,
+                    error_rate: tnc_er,
+                    caller_probability: prob_indels,
+                    mapq_filtered_ref: s.mapq_filtered_ref,
+                    mapq_filtered_alt: s.mapq_filtered_alt,
+                    bq_filtered_ref: s.bq_filtered_ref,
+                    bq_filtered_alt: s.bq_filtered_alt,
+                    average_ref_mapq,
+                    average_alt_mapq,
+                    average_ref_bq,
+                    average_alt_bq,
+                    avg_ref_dist,
+                    avg_alt_dist,
+                    avg_ref_ins,
+                    avg_alt_ins,
+                    fwd_probability: fwd_bias_indels,
+                    rev_probability: rev_bias_indels,
+                    large_entropy,
+                    small_entropy,
+                    read_end_filtered_count: s.read_end_filtered_count_indels,
+                    avg_mismatch_per_read: avg_mismatch,
+                    mismatch_filtered_count: s.mismatch_filtered_count,
+                    avg_read_length,
+                    fwd_count: fwd_count_indels,
+                    rev_count: rev_count_indels,
+                    total_count: both_count_indels,
+                    tnc_up: upstream as char,
+                    tnc_ref: ref_base as char,
+                    tnc_down: downstream as char,
+                    vt,
+                };
+                let model_features = build_model_feature_vector(&model_inputs);
+                let model_probability = model_probability_score(model_config, &model_features);
+                if model_probability <= model_config.threshold {
+                    continue;
+                }
                 let genotype = assign_genotype(alt_counts, total_depth_filtered as usize, 0.05);
 
                 variants.push(Variant::new(
                     ref_name.to_string(), pos + 1,
-                    candidate.get_reference_allele(), candidate.get_alternate_allele(),
+                    ref_allele, alt_allele,
                     genotype.genotype, genotype.score,
                     total_depth_filtered as u32, alt_counts as u32,
                     CallingDirective::BothStrands, tnc_er, ctx.clone(),
