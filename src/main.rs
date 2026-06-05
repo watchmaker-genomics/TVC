@@ -26,6 +26,15 @@ use tracing_subscriber::fmt as subscriber_fmt;
 use tracing_subscriber::EnvFilter;
 use tracing::info;
 
+#[cfg(feature = "onnx-inference")]
+use onnxruntime::environment::Environment;
+#[cfg(feature = "onnx-inference")]
+use onnxruntime::ndarray::Array2;
+#[cfg(feature = "onnx-inference")]
+use onnxruntime::tensor::OrtOwnedTensor;
+#[cfg(feature = "onnx-inference")]
+use onnxruntime::{GraphOptimizationLevel, LoggingLevel};
+
 const MODEL_TNC_BASES: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
 const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
 
@@ -1048,29 +1057,83 @@ fn build_model_feature_vector(inputs: &ModelFeatureInputs) -> Vec<f32> {
         .collect()
 }
 
-/// Placeholder ONNX inference hook.
-///
-/// Replace this function body with your ONNX runtime call. The signature and
-/// call sites are already wired so you can plug inference in one place.
-fn run_onnx_inference_placeholder(
-    _model_path: &str,
+#[cfg(feature = "onnx-inference")]
+/// ONNX inference hook.
+fn run_onnx_inference(
+    session: &mut onnxruntime::session::Session<'_>,
     features: &[f32],
 ) -> Result<f64, Box<dyn std::error::Error>> {
     if features.len() < 2 {
         return Err("Feature vector must contain at least DP and AO".into());
     }
 
-    // Temporary proxy score based on allele fraction.
-    let depth = features[0] as f64;
-    let alt_counts = features[1] as f64;
-    let probability = if depth > 0.0 { alt_counts / depth } else { 0.0 };
+    let input = Array2::from_shape_vec((1, features.len()), features.to_vec())?;
+    let outputs: Vec<OrtOwnedTensor<'_, '_, f32, _>> = session.run(vec![input])?;
+
+    let output = outputs
+        .first()
+        .ok_or("Model returned no outputs")?;
+
+    let values: Vec<f32> = output.iter().copied().collect();
+    if values.is_empty() {
+        return Err("Model output tensor is empty".into());
+    }
+
+    // Common binary classifiers emit either one probability or two class scores.
+    let probability = if values.len() == 1 {
+        values[0] as f64
+    } else {
+        let p0 = values[0] as f64;
+        let p1 = values[1] as f64;
+        let sum = p0 + p1;
+
+        if p0 >= 0.0
+            && p0 <= 1.0
+            && p1 >= 0.0
+            && p1 <= 1.0
+            && (sum - 1.0).abs() < 1e-3
+        {
+            p1
+        } else if sum > 0.0 {
+            p1 / sum
+        } else {
+            0.0
+        }
+    };
 
     Ok(probability.clamp(0.0, 1.0))
 }
 
+#[cfg(not(feature = "onnx-inference"))]
+/// ONNX inference hook fallback when the feature is disabled.
+fn run_onnx_inference(_model_path: &str, _features: &[f32]) -> Result<f64, Box<dyn std::error::Error>> {
+    Err("Built without ONNX inference support; enable feature 'onnx-inference'".into())
+}
+
+#[cfg(feature = "onnx-inference")]
+fn model_probability_score(
+    config: &ModelInferenceConfig,
+    features: &[f32],
+    onnx_session: Option<&mut onnxruntime::session::Session<'_>>,
+) -> f64 {
+    if config.model_exists {
+        match onnx_session {
+            Some(session) => match run_onnx_inference(session, features) {
+                Ok(probability) => probability,
+                Err(_) => 1.0,
+            },
+            None => 1.0,
+        }
+    } else {
+        // No model file yet: keep baseline caller behavior (no ML filtering).
+        1.0
+    }
+}
+
+#[cfg(not(feature = "onnx-inference"))]
 fn model_probability_score(config: &ModelInferenceConfig, features: &[f32]) -> f64 {
     if config.model_exists {
-        match run_onnx_inference_placeholder(&config.model_path, features) {
+        match run_onnx_inference(&config.model_path, features) {
             Ok(probability) => probability,
             Err(_) => {
                 // If runtime inference fails, do not drop calls silently.
@@ -1736,6 +1799,30 @@ fn call_variants(
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
     let model_config = model_inference_config(model_path, ml_threshold);
 
+    #[cfg(feature = "onnx-inference")]
+    let environment = if model_config.model_exists {
+        Some(
+            Environment::builder()
+                .with_name("tvc-onnx")
+                .with_log_level(LoggingLevel::Warning)
+                .build()?,
+        )
+    } else {
+        None
+    };
+
+    #[cfg(feature = "onnx-inference")]
+    let mut onnx_session = if let Some(env) = &environment {
+        Some(
+            env.new_session_builder()?
+                .with_optimization_level(GraphOptimizationLevel::Basic)?
+                .with_number_threads(1)?
+                .with_model_from_file(&model_config.model_path)?,
+        )
+    } else {
+        None
+    };
+
     let error_map = compute_tnc_error_rates(
         chunk, bam_path, ref_seq, min_bq, min_mapq, min_depth,
         end_of_read_cutoff, indel_end_of_read_cutoff, max_mismatches,
@@ -1916,6 +2003,10 @@ fn call_variants(
                     vt,
                 };
                 let model_features = build_model_feature_vector(&model_inputs);
+                #[cfg(feature = "onnx-inference")]
+                let model_probability =
+                    model_probability_score(model_config, &model_features, onnx_session.as_mut());
+                #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
                 if model_probability <= model_config.threshold {
                     continue;
@@ -1983,6 +2074,10 @@ fn call_variants(
                     vt,
                 };
                 let model_features = build_model_feature_vector(&model_inputs);
+                #[cfg(feature = "onnx-inference")]
+                let model_probability =
+                    model_probability_score(model_config, &model_features, onnx_session.as_mut());
+                #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
                 if model_probability <= model_config.threshold {
                     continue;
