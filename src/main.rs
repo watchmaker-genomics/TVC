@@ -24,10 +24,10 @@ use std::thread;
 use std::time::Duration;
 use tracing_subscriber::fmt as subscriber_fmt;
 use tracing_subscriber::EnvFilter;
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(feature = "onnx-inference")]
-use tract_onnx::prelude::*;
+use ort::{session::Session as OrtSession, value::TensorRef};
 
 const MODEL_TNC_BASES: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
 const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
@@ -1061,23 +1061,21 @@ fn build_model_feature_vector(inputs: &ModelFeatureInputs) -> Vec<f32> {
 #[cfg(feature = "onnx-inference")]
 /// ONNX inference hook.
 fn run_onnx_inference(
-    model: &Arc<TypedRunnableModel>,
+    model: &mut OrtSession,
     features: &[f32],
 ) -> Result<f64, Box<dyn std::error::Error>> {
     if features.len() < 2 {
         return Err("Feature vector must contain at least DP and AO".into());
     }
 
-    let input = tract_ndarray::Array2::from_shape_vec((1, features.len()), features.to_vec())?;
-    let outputs = model.run(tvec!(input.into_tensor().into()))?;
+    let input = TensorRef::from_array_view(([1_usize, features.len()], features))?;
+    let outputs = model.run(ort::inputs![input])?;
+    if outputs.len() == 0 {
+        return Err("Model returned no outputs".into());
+    }
+    let output = &outputs[0];
 
-    let output = outputs
-        .first()
-        .ok_or("Model returned no outputs")?;
-
-    let output = output.to_plain_array_view::<f32>()?;
-
-    let values: Vec<f32> = output.iter().copied().collect();
+    let (_, values) = output.try_extract_tensor::<f32>()?;
     if values.is_empty() {
         return Err("Model output tensor is empty".into());
     }
@@ -1117,7 +1115,7 @@ fn run_onnx_inference(_model_path: &str, _features: &[f32]) -> Result<f64, Box<d
 fn model_probability_score(
     config: &ModelInferenceConfig,
     features: &[f32],
-    onnx_model: Option<&Arc<TypedRunnableModel>>,
+    onnx_model: Option<&mut OrtSession>,
 ) -> f64 {
     if config.model_exists {
         match onnx_model {
@@ -1803,13 +1801,21 @@ fn call_variants(
     let model_config = model_inference_config(model_path, ml_threshold);
 
     #[cfg(feature = "onnx-inference")]
-    let onnx_model = if model_config.model_exists {
-        Some(
-            tract_onnx::onnx()
-                .model_for_path(&model_config.model_path)?
-                .into_optimized()?
-                .into_runnable()?,
-        )
+    let mut onnx_model = if model_config.model_exists {
+        match OrtSession::builder().and_then(|mut b| b.commit_from_file(&model_config.model_path)) {
+            Ok(model) => Some(model),
+            Err(err) => {
+                static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
+                ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
+                    warn!(
+                        "Failed to load ONNX model at {} with ONNX Runtime backend ({}). Falling back to baseline scoring.",
+                        model_config.model_path,
+                        err
+                    );
+                });
+                None
+            }
+        }
     } else {
         None
     };
@@ -1996,7 +2002,7 @@ fn call_variants(
                 let model_features = build_model_feature_vector(&model_inputs);
                 #[cfg(feature = "onnx-inference")]
                 let model_probability =
-                    model_probability_score(model_config, &model_features, onnx_model.as_ref());
+                    model_probability_score(model_config, &model_features, onnx_model.as_mut());
                 #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
                 if model_probability <= model_config.threshold {
@@ -2067,7 +2073,7 @@ fn call_variants(
                 let model_features = build_model_feature_vector(&model_inputs);
                 #[cfg(feature = "onnx-inference")]
                 let model_probability =
-                    model_probability_score(model_config, &model_features, onnx_model.as_ref());
+                    model_probability_score(model_config, &model_features, onnx_model.as_mut());
                 #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
                 if model_probability <= model_config.threshold {

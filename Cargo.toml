@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-onnx-inference = ["dep:tract-onnx"]
+onnx-inference = ["dep:ort"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -18,4 +18,4 @@ rayon = "1.7"
 indicatif = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tract-onnx = { version = "0.23", optional = true }
+ort = { version = "2.0.0-rc.12", optional = true }
