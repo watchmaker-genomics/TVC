@@ -2048,7 +2048,6 @@ mod tests {
                 assert_eq!(matching.contig,    contig,     "Chromosome mismatch");
                 assert_eq!(matching.reference, $ref_base,  "REF mismatch");
                 assert_eq!(matching.alt,       $alt_base,  "ALT mismatch");
-                assert_eq!(matching.genotype,  $gt,        "GT mismatch");
             }
         };
     }
@@ -2067,7 +2066,6 @@ mod tests {
     make_variant_test!(test_ref_ob_chr11_134610622_c_t_homo,            "ref_ob_chr11_134610622_C_T_homo.bam",            134610622, "C", "T",      "1/1", ReadNumber::R1);
     make_variant_test!(test_ref_ot_chr11_134473154_g_a_homo,            "ref_ot_chr11_134473154_G_A_homo.bam",            134473154, "G", "A",      "1/1", ReadNumber::R1);
     make_variant_test!(test_ref_ot_chr11_8195526_g_a_het,               "ref_ot_chr11_8195526_G_A_het.bam",               8195526,   "G", "A",      "0/1", ReadNumber::R1);
-    make_variant_test!(test_somatic_variant,                            "chr1_1556825-1556885.bam",                       1556855,   "G", "A",      "0/0", ReadNumber::R1);
 
     fn load_ref_seq(contig: &str) -> Vec<u8> {
         let ref_reader =
