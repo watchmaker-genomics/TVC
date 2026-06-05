@@ -24,14 +24,12 @@ use std::thread;
 use std::time::Duration;
 use tracing::info;
 
-const MODEL_PATH_PLACEHOLDER: &str = "model.onnx";
 const MODEL_PROBABILITY_THRESHOLD: f64 = 0.3;
 const MODEL_TNC_BASES: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
 const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
 
-// IMPORTANT: This must match the exported ONNX model input column order.
-// It mirrors the Python training script: NUMERIC_FEATURES + engineered terms
-// + one-hot categorical dummies.
+// This must match the exported ONNX model input column order.
+// NUMERIC_FEATURES + engineered terms + one-hot categorical dummies.
 const MODEL_FEATURE_ORDER: [&str; 53] = [
     "DP", "AO", "ER", "PR",
     "MFR", "MFA", "BFR", "BFA",
@@ -120,6 +118,9 @@ struct Args {
 
     #[arg(short = 'l', long, value_enum, default_value_t = LogLevel::Info)]
     log_level: LogLevel,
+
+    #[arg(short = 'k', long, default_value = "model.onnx")]
+    model_path: String,
 
 }
 
@@ -831,7 +832,7 @@ fn get_count_vec_candidates(
 /// # Arguments
 /// * `alt_counts` - Count of reads supporting the alternate allele
 /// * `depth` - Total read depth at the position
-/// * `error_rate` - Expected general error rate
+/// * `error_rate` - Expected error rate
 ///
 /// # Returns
 /// A Genotype instance with assigned genotype and quality score
@@ -912,10 +913,10 @@ struct ModelFeatureInputs {
     vt: &'static str,
 }
 
-fn model_inference_config() -> &'static ModelInferenceConfig {
+fn model_inference_config(model_path: &str) -> &'static ModelInferenceConfig {
     static CONFIG: OnceLock<ModelInferenceConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
-        let model_path = MODEL_PATH_PLACEHOLDER.to_string();
+        let model_path = model_path.to_string();
         let model_exists = Path::new(&model_path).exists();
 
         if model_exists {
@@ -1456,6 +1457,7 @@ pub fn workflow(
     error_rate: f64,
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
+    model_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TVC workflow");
     validate_fai_and_bam(ref_path, bam_path)?;
@@ -1523,6 +1525,7 @@ pub fn workflow(
                     error_rate,
                     stranded_read,
                     indel_filter_repeat_limit,
+                    model_path,
                 )
                 .unwrap_or_else(|_e| Vec::new());
                 open_files_counter.fetch_sub(1, Ordering::SeqCst);
@@ -1723,8 +1726,9 @@ fn call_variants(
     error_rate: f64,
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
+    model_path: &str,
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
-    let model_config = model_inference_config();
+    let model_config = model_inference_config(model_path);
 
     let error_map = compute_tnc_error_rates(
         chunk, bam_path, ref_seq, min_bq, min_mapq, min_depth,
@@ -2029,7 +2033,7 @@ mod tests {
                 let chunk = GenomeChunk::new(contig.to_string(), $pos, $pos + 1);
                 let variants = call_variants(
                     &chunk, test_bam, &ref_seq,
-                    20, 1, 1, 5, 20, 10, 1, 0.005, &$stranded_read, 3,
+                    20, 1, 1, 5, 20, 10, 1, 0.005, &$stranded_read, 3, "model.onnx",
                 )
                 .expect("call_variants failed");
 
@@ -2088,7 +2092,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3,
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx",
         )
         .expect("call_variants failed");
 
@@ -2105,7 +2109,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.single_end.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3,
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx",
         )
         .expect("call_variants failed");
 
@@ -2122,7 +2126,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R2, 3,
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R2, 3, "model.onnx",
         )
         .expect("call_variants failed");
 
