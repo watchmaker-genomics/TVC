@@ -3,6 +3,10 @@ name = "tvc"
 version = "1.1.0"
 edition = "2021"
 
+[features]
+default = []
+onnx-inference = ["dep:tract-onnx"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 litemap = "=0.7.4"
@@ -14,3 +18,4 @@ rayon = "1.7"
 indicatif = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tract-onnx = { version = "0.23", optional = true }
