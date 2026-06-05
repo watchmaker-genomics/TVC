@@ -22,9 +22,10 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+use tracing_subscriber::fmt as subscriber_fmt;
+use tracing_subscriber::EnvFilter;
 use tracing::info;
 
-const MODEL_PROBABILITY_THRESHOLD: f64 = 0.3;
 const MODEL_TNC_BASES: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
 const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
 
@@ -121,7 +122,9 @@ struct Args {
 
     #[arg(short = 'k', long, default_value = "model.onnx")]
     model_path: String,
-
+    
+    #[arg(short = 'n', long, default_value_t = 0.3)]
+    ml_threshold: f64,
 }
 
 /// Representation of a genomic variant
@@ -913,7 +916,7 @@ struct ModelFeatureInputs {
     vt: &'static str,
 }
 
-fn model_inference_config(model_path: &str) -> &'static ModelInferenceConfig {
+fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static ModelInferenceConfig {
     static CONFIG: OnceLock<ModelInferenceConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let model_path = model_path.to_string();
@@ -933,7 +936,7 @@ fn model_inference_config(model_path: &str) -> &'static ModelInferenceConfig {
 
         ModelInferenceConfig {
             model_path,
-            threshold: MODEL_PROBABILITY_THRESHOLD,
+            threshold: ml_threshold,
             model_exists,
         }
     })
@@ -1458,6 +1461,7 @@ pub fn workflow(
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
     model_path: &str,
+    ml_threshold: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TVC workflow");
     validate_fai_and_bam(ref_path, bam_path)?;
@@ -1526,6 +1530,7 @@ pub fn workflow(
                     stranded_read,
                     indel_filter_repeat_limit,
                     model_path,
+                    ml_threshold,
                 )
                 .unwrap_or_else(|_e| Vec::new());
                 open_files_counter.fetch_sub(1, Ordering::SeqCst);
@@ -1727,8 +1732,9 @@ fn call_variants(
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
     model_path: &str,
+    ml_threshold: f64,
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
-    let model_config = model_inference_config(model_path);
+    let model_config = model_inference_config(model_path, ml_threshold);
 
     let error_map = compute_tnc_error_rates(
         chunk, bam_path, ref_seq, min_bq, min_mapq, min_depth,
@@ -2004,6 +2010,56 @@ fn call_variants(
     Ok(variants)
 }
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    let bam_path = &args.input_bam;
+    let vcf_path = &args.output_vcf;
+    let min_bq = args.min_bq;
+    let min_mapq = args.min_mapq;
+    let min_depth = args.min_depth;
+    let ref_path = &args.input_ref;
+    let end_of_read_cutoff = args.end_of_read_cutoff;
+    let indel_end_of_read_cutoff = args.indel_end_of_read_cutoff;
+    let max_mismatches = args.max_mismatches;
+    let min_ao = args.min_ao;
+    let num_threads = args.num_threads;
+    let chunk_size = args.chunk_size;
+    let error_rate = args.error_rate;
+    let stranded_read = &args.stranded_read;
+    let indel_filter_repeat_limit = args.indel_filter_repeat_limit;
+    let model_path = &args.model_path;
+    let ml_threshold = args.ml_threshold;
+
+    let level = args.log_level.as_str(); // use the enum value from clap
+
+    subscriber_fmt()
+        .with_env_filter(EnvFilter::new(level))
+        .with_target(false)
+        .init();
+
+    workflow(
+        bam_path,
+        ref_path,
+        vcf_path,
+        min_bq,
+        min_mapq,
+        min_depth,
+        end_of_read_cutoff,
+        indel_end_of_read_cutoff,
+        max_mismatches,
+        min_ao,
+        num_threads,
+        chunk_size,
+        error_rate,
+        stranded_read,
+        indel_filter_repeat_limit,
+        model_path,
+        ml_threshold,
+    )?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2033,7 +2089,7 @@ mod tests {
                 let chunk = GenomeChunk::new(contig.to_string(), $pos, $pos + 1);
                 let variants = call_variants(
                     &chunk, test_bam, &ref_seq,
-                    20, 1, 1, 5, 20, 10, 1, 0.005, &$stranded_read, 3, "model.onnx",
+                    20, 1, 1, 5, 20, 10, 1, 0.005, &$stranded_read, 3, "model.onnx", 0.3
                 )
                 .expect("call_variants failed");
 
@@ -2092,7 +2148,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx",
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.3
         )
         .expect("call_variants failed");
 
@@ -2109,7 +2165,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.single_end.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx",
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.3
         )
         .expect("call_variants failed");
 
@@ -2126,7 +2182,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R2, 3, "model.onnx",
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R2, 3, "model.onnx", 0.3
         )
         .expect("call_variants failed");
 
