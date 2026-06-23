@@ -10,6 +10,8 @@ use rust_htslib::bam::record::Cigar;
 use rust_htslib::bam::{self, Read};
 use rust_htslib::faidx;
 use statrs::distribution::{Binomial, Discrete, DiscreteCDF};
+#[cfg(feature = "onnx-inference")]
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
@@ -28,6 +30,11 @@ use tracing::{info, warn};
 
 #[cfg(feature = "onnx-inference")]
 use ort::{session::Session as OrtSession, value::TensorRef};
+
+#[cfg(feature = "onnx-inference")]
+thread_local! {
+    static THREAD_LOCAL_ONNX_MODELS: RefCell<HashMap<String, Option<OrtSession>>> = RefCell::new(HashMap::new());
+}
 
 const MODEL_TNC_BASES: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
 const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
@@ -1059,6 +1066,94 @@ fn build_model_feature_vector(inputs: &ModelFeatureInputs) -> Vec<f32> {
 }
 
 #[cfg(feature = "onnx-inference")]
+fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
+    let builder = match OrtSession::builder() {
+        Ok(b) => b,
+        Err(err) => {
+            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
+            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
+                warn!(
+                    "Failed to initialize ONNX Runtime session builder ({}). Falling back to baseline scoring.",
+                    err
+                );
+            });
+            return None;
+        }
+    };
+
+    let builder = match builder.with_intra_threads(1) {
+        Ok(b) => b,
+        Err(err) => {
+            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
+            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
+                warn!(
+                    "Failed to configure ONNX intra-op threads ({}). Falling back to baseline scoring.",
+                    err
+                );
+            });
+            return None;
+        }
+    };
+
+    let builder = match builder.with_inter_threads(1) {
+        Ok(b) => b,
+        Err(err) => {
+            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
+            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
+                warn!(
+                    "Failed to configure ONNX inter-op threads ({}). Falling back to baseline scoring.",
+                    err
+                );
+            });
+            return None;
+        }
+    };
+
+    let builder = match builder.with_intra_op_spinning(false) {
+        Ok(b) => b,
+        Err(err) => {
+            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
+            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
+                warn!(
+                    "Failed to configure ONNX intra-op spinning ({}). Falling back to baseline scoring.",
+                    err
+                );
+            });
+            return None;
+        }
+    };
+
+    let mut builder = match builder.with_inter_op_spinning(false) {
+        Ok(b) => b,
+        Err(err) => {
+            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
+            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
+                warn!(
+                    "Failed to configure ONNX inter-op spinning ({}). Falling back to baseline scoring.",
+                    err
+                );
+            });
+            return None;
+        }
+    };
+
+    match builder.commit_from_file(model_path) {
+        Ok(model) => Some(model),
+        Err(err) => {
+            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
+            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
+                warn!(
+                    "Failed to load ONNX model at {} with ONNX Runtime backend ({}). Falling back to baseline scoring.",
+                    model_path,
+                    err
+                );
+            });
+            None
+        }
+    }
+}
+
+#[cfg(feature = "onnx-inference")]
 /// ONNX inference hook.
 fn run_onnx_inference(
     model: &mut OrtSession,
@@ -1115,20 +1210,27 @@ fn run_onnx_inference(_model_path: &str, _features: &[f32]) -> Result<f64, Box<d
 fn model_probability_score(
     config: &ModelInferenceConfig,
     features: &[f32],
-    onnx_model: Option<&mut OrtSession>,
 ) -> f64 {
-    if config.model_exists {
-        match onnx_model {
-            Some(model) => match run_onnx_inference(model, features) {
-                Ok(probability) => probability,
-                Err(_) => 1.0,
-            },
+    if !config.model_exists {
+        // No model file yet: keep baseline caller behavior (no ML filtering).
+        return 1.0;
+    }
+
+    THREAD_LOCAL_ONNX_MODELS.with(|models| {
+        let mut models = models.borrow_mut();
+        if !models.contains_key(config.model_path.as_str()) {
+            let model = load_onnx_session(&config.model_path);
+            models.insert(config.model_path.clone(), model);
+        }
+
+        match models
+            .get_mut(config.model_path.as_str())
+            .and_then(|m| m.as_mut())
+        {
+            Some(model) => run_onnx_inference(model, features).unwrap_or(1.0),
             None => 1.0,
         }
-    } else {
-        // No model file yet: keep baseline caller behavior (no ML filtering).
-        1.0
-    }
+    })
 }
 
 #[cfg(not(feature = "onnx-inference"))]
@@ -1800,26 +1902,6 @@ fn call_variants(
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
     let model_config = model_inference_config(model_path, ml_threshold);
 
-    #[cfg(feature = "onnx-inference")]
-    let mut onnx_model = if model_config.model_exists {
-        match OrtSession::builder().and_then(|mut b| b.commit_from_file(&model_config.model_path)) {
-            Ok(model) => Some(model),
-            Err(err) => {
-                static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
-                ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
-                    warn!(
-                        "Failed to load ONNX model at {} with ONNX Runtime backend ({}). Falling back to baseline scoring.",
-                        model_config.model_path,
-                        err
-                    );
-                });
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let error_map = compute_tnc_error_rates(
         chunk, bam_path, ref_seq, min_bq, min_mapq, min_depth,
         end_of_read_cutoff, indel_end_of_read_cutoff, max_mismatches,
@@ -2001,8 +2083,7 @@ fn call_variants(
                 };
                 let model_features = build_model_feature_vector(&model_inputs);
                 #[cfg(feature = "onnx-inference")]
-                let model_probability =
-                    model_probability_score(model_config, &model_features, onnx_model.as_mut());
+                let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
                 if model_probability <= model_config.threshold {
@@ -2072,8 +2153,7 @@ fn call_variants(
                 };
                 let model_features = build_model_feature_vector(&model_inputs);
                 #[cfg(feature = "onnx-inference")]
-                let model_probability =
-                    model_probability_score(model_config, &model_features, onnx_model.as_mut());
+                let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
                 if model_probability <= model_config.threshold {

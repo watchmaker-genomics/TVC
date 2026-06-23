@@ -18,4 +18,4 @@ rayon = "1.7"
 indicatif = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-ort = { version = "2.0.0-rc.12", optional = true }
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-24"] }
