@@ -889,6 +889,7 @@ struct ModelInferenceConfig {
     model_path: String,
     threshold: f64,
     model_exists: bool,
+    model_feature_order: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -926,18 +927,37 @@ struct ModelFeatureInputs {
     vt: &'static str,
 }
 
+fn default_model_feature_order() -> Vec<String> {
+    MODEL_FEATURE_ORDER.iter().map(|s| (*s).to_string()).collect()
+}
+
 fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static ModelInferenceConfig {
     static CONFIG: OnceLock<ModelInferenceConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let model_path = model_path.to_string();
         let model_exists = Path::new(&model_path).exists();
+        let mut model_feature_order = default_model_feature_order();
 
         if model_exists {
             #[cfg(feature = "onnx-inference")]
-            info!(
-                "Detected ONNX model at {}. Real ONNX inference is enabled.",
-                model_path
-            );
+            {
+                info!(
+                    "Detected ONNX model at {}. Real ONNX inference is enabled.",
+                    model_path
+                );
+                if let Some(feature_order) = load_feature_order_from_model(&model_path) {
+                    info!(
+                        "Loaded ONNX feature_order metadata with {} features.",
+                        feature_order.len()
+                    );
+                    model_feature_order = feature_order;
+                } else {
+                    warn!(
+                        "Could not read ONNX feature_order metadata from {}. Falling back to built-in 53-feature order.",
+                        model_path
+                    );
+                }
+            }
 
             #[cfg(not(feature = "onnx-inference"))]
             info!(
@@ -955,6 +975,7 @@ fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static Model
             model_path,
             threshold: ml_threshold,
             model_exists,
+            model_feature_order,
         }
     })
 }
@@ -962,7 +983,10 @@ fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static Model
 /// Build model input features in a stable order.
 ///
 /// IMPORTANT: keep the order in sync with model training.
-fn build_model_feature_vector(inputs: &ModelFeatureInputs) -> Vec<f32> {
+fn build_model_feature_vector(
+    inputs: &ModelFeatureInputs,
+    feature_order: &[String],
+) -> Vec<f32> {
     let af = if inputs.depth > 0.0 {
         inputs.alt_counts / inputs.depth
     } else {
@@ -1059,15 +1083,15 @@ fn build_model_feature_vector(inputs: &ModelFeatureInputs) -> Vec<f32> {
         );
     }
 
-    MODEL_FEATURE_ORDER
+    feature_order
         .iter()
-        .map(|k| values.get(*k).copied().unwrap_or(0.0) as f32)
+        .map(|k| values.get(k.as_str()).copied().unwrap_or(0.0) as f32)
         .collect()
 }
 
 #[cfg(feature = "onnx-inference")]
 fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
-    let builder = match OrtSession::builder() {
+    let mut builder = match OrtSession::builder() {
         Ok(b) => b,
         Err(err) => {
             static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
@@ -1081,62 +1105,8 @@ fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
         }
     };
 
-    let builder = match builder.with_intra_threads(1) {
-        Ok(b) => b,
-        Err(err) => {
-            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
-            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
-                warn!(
-                    "Failed to configure ONNX intra-op threads ({}). Falling back to baseline scoring.",
-                    err
-                );
-            });
-            return None;
-        }
-    };
-
-    let builder = match builder.with_inter_threads(1) {
-        Ok(b) => b,
-        Err(err) => {
-            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
-            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
-                warn!(
-                    "Failed to configure ONNX inter-op threads ({}). Falling back to baseline scoring.",
-                    err
-                );
-            });
-            return None;
-        }
-    };
-
-    let builder = match builder.with_intra_op_spinning(false) {
-        Ok(b) => b,
-        Err(err) => {
-            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
-            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
-                warn!(
-                    "Failed to configure ONNX intra-op spinning ({}). Falling back to baseline scoring.",
-                    err
-                );
-            });
-            return None;
-        }
-    };
-
-    let mut builder = match builder.with_inter_op_spinning(false) {
-        Ok(b) => b,
-        Err(err) => {
-            static ONNX_MODEL_LOAD_WARNING_LOGGED: OnceLock<()> = OnceLock::new();
-            ONNX_MODEL_LOAD_WARNING_LOGGED.get_or_init(|| {
-                warn!(
-                    "Failed to configure ONNX inter-op spinning ({}). Falling back to baseline scoring.",
-                    err
-                );
-            });
-            return None;
-        }
-    };
-
+    // Use ONNX Runtime defaults for threading/spinning. Custom overrides can
+    // deadlock in some environments during test execution.
     match builder.commit_from_file(model_path) {
         Ok(model) => Some(model),
         Err(err) => {
@@ -1154,6 +1124,36 @@ fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
 }
 
 #[cfg(feature = "onnx-inference")]
+fn load_feature_order_from_model(model_path: &str) -> Option<Vec<String>> {
+    let session = load_onnx_session(model_path)?;
+    let metadata = session.metadata().ok()?;
+    let raw = metadata.custom("feature_order")?;
+    let feature_order: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if feature_order.is_empty() {
+        None
+    } else {
+        Some(feature_order)
+    }
+}
+
+#[cfg(feature = "onnx-inference")]
+fn expected_input_width(model: &OrtSession) -> Option<usize> {
+    let first_input = model.inputs().first()?;
+    let shape = first_input.dtype().tensor_shape()?;
+    let width = *shape.last()?;
+    if width > 0 {
+        Some(width as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "onnx-inference")]
 /// ONNX inference hook.
 fn run_onnx_inference(
     model: &mut OrtSession,
@@ -1161,6 +1161,17 @@ fn run_onnx_inference(
 ) -> Result<f64, Box<dyn std::error::Error>> {
     if features.len() < 2 {
         return Err("Feature vector must contain at least DP and AO".into());
+    }
+
+    if let Some(expected_width) = expected_input_width(model) {
+        if features.len() != expected_width {
+            return Err(format!(
+                "Model input width mismatch: model expects {}, got {} features",
+                expected_width,
+                features.len()
+            )
+            .into());
+        }
     }
 
     let input = TensorRef::from_array_view(([1_usize, features.len()], features))?;
@@ -2081,7 +2092,8 @@ fn call_variants(
                     tnc_down: downstream as char,
                     vt,
                 };
-                let model_features = build_model_feature_vector(&model_inputs);
+                let model_features =
+                    build_model_feature_vector(&model_inputs, &model_config.model_feature_order);
                 #[cfg(feature = "onnx-inference")]
                 let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
@@ -2151,7 +2163,8 @@ fn call_variants(
                     tnc_down: downstream as char,
                     vt,
                 };
-                let model_features = build_model_feature_vector(&model_inputs);
+                let model_features =
+                    build_model_feature_vector(&model_inputs, &model_config.model_feature_order);
                 #[cfg(feature = "onnx-inference")]
                 let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
