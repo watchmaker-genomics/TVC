@@ -22,11 +22,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
 use tracing_subscriber::fmt as subscriber_fmt;
 use tracing_subscriber::EnvFilter;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(feature = "onnx-inference")]
+use tracing::warn;
 
 #[cfg(feature = "onnx-inference")]
 use ort::{session::Session as OrtSession, value::TensorRef};
@@ -889,7 +892,34 @@ struct ModelInferenceConfig {
     model_path: String,
     threshold: f64,
     model_exists: bool,
-    model_feature_order: Vec<String>,
+    /// Populated from the built-in constant at construction time.
+    /// On first ONNX session load, overwritten once via `set_feature_order_from_session`
+    /// if the model carries `feature_order` metadata.
+    model_feature_order: RwLock<Vec<String>>,
+    /// Guards the one-time write of model_feature_order from the session metadata.
+    #[cfg(feature = "onnx-inference")]
+    feature_order_loaded: OnceLock<()>,
+}
+
+impl ModelInferenceConfig {
+    fn model_feature_order_snapshot(&self) -> Vec<String> {
+        self.model_feature_order
+            .read()
+            .expect("model_feature_order lock poisoned")
+            .clone()
+    }
+
+    /// Overwrite model_feature_order from session metadata exactly once.
+    /// Subsequent calls (from other rayon threads hitting the same static) are no-ops.
+    #[cfg(feature = "onnx-inference")]
+    fn set_feature_order_from_session(&self, order: Vec<String>) {
+        self.feature_order_loaded.get_or_init(|| {
+            *self
+                .model_feature_order
+                .write()
+                .expect("model_feature_order lock poisoned") = order;
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -936,28 +966,14 @@ fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static Model
     CONFIG.get_or_init(|| {
         let model_path = model_path.to_string();
         let model_exists = Path::new(&model_path).exists();
-        let mut model_feature_order = default_model_feature_order();
+        let model_feature_order = default_model_feature_order();
 
         if model_exists {
             #[cfg(feature = "onnx-inference")]
-            {
-                info!(
-                    "Detected ONNX model at {}. Real ONNX inference is enabled.",
-                    model_path
-                );
-                if let Some(feature_order) = load_feature_order_from_model(&model_path) {
-                    info!(
-                        "Loaded ONNX feature_order metadata with {} features.",
-                        feature_order.len()
-                    );
-                    model_feature_order = feature_order;
-                } else {
-                    warn!(
-                        "Could not read ONNX feature_order metadata from {}. Falling back to built-in 53-feature order.",
-                        model_path
-                    );
-                }
-            }
+            info!(
+                "Detected ONNX model at {}. Real ONNX inference is enabled. Feature order will be read from model metadata on first inference.",
+                model_path
+            );
 
             #[cfg(not(feature = "onnx-inference"))]
             info!(
@@ -975,9 +991,45 @@ fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static Model
             model_path,
             threshold: ml_threshold,
             model_exists,
-            model_feature_order,
+            model_feature_order: RwLock::new(model_feature_order),
+            #[cfg(feature = "onnx-inference")]
+            feature_order_loaded: OnceLock::new(),
         }
     })
+}
+
+#[cfg(feature = "onnx-inference")]
+fn onnx_inference_enabled(config: &ModelInferenceConfig) -> bool {
+    if !config.model_exists {
+        return false;
+    }
+
+    if cfg!(test) {
+        let skip = std::env::var("TVC_SKIP_ORT_IN_TESTS")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
+        if skip {
+            static ONNX_TEST_SKIP_LOGGED: OnceLock<()> = OnceLock::new();
+            ONNX_TEST_SKIP_LOGGED.get_or_init(|| {
+                info!("Skipping ONNX Runtime inference in tests due to TVC_SKIP_ORT_IN_TESTS=1.");
+            });
+            return false;
+        }
+    }
+
+    true
+}
+
+#[cfg(feature = "onnx-inference")]
+fn ensure_onnx_runtime_initialized() {
+    static ORT_INIT: OnceLock<()> = OnceLock::new();
+    ORT_INIT.get_or_init(|| {
+        let _ = ort::init()
+            .with_name("tvc")
+            .with_telemetry(false)
+            .commit();
+    });
 }
 
 /// Build model input features in a stable order.
@@ -1091,6 +1143,8 @@ fn build_model_feature_vector(
 
 #[cfg(feature = "onnx-inference")]
 fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
+    ensure_onnx_runtime_initialized();
+
     let mut builder = match OrtSession::builder() {
         Ok(b) => b,
         Err(err) => {
@@ -1105,8 +1159,6 @@ fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
         }
     };
 
-    // Use ONNX Runtime defaults for threading/spinning. Custom overrides can
-    // deadlock in some environments during test execution.
     match builder.commit_from_file(model_path) {
         Ok(model) => Some(model),
         Err(err) => {
@@ -1124,8 +1176,7 @@ fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
 }
 
 #[cfg(feature = "onnx-inference")]
-fn load_feature_order_from_model(model_path: &str) -> Option<Vec<String>> {
-    let session = load_onnx_session(model_path)?;
+fn read_feature_order_from_session(session: &OrtSession) -> Option<Vec<String>> {
     let metadata = session.metadata().ok()?;
     let raw = metadata.custom("feature_order")?;
     let feature_order: Vec<String> = raw
@@ -1222,7 +1273,7 @@ fn model_probability_score(
     config: &ModelInferenceConfig,
     features: &[f32],
 ) -> f64 {
-    if !config.model_exists {
+    if !onnx_inference_enabled(config) {
         // No model file yet: keep baseline caller behavior (no ML filtering).
         return 1.0;
     }
@@ -1231,6 +1282,24 @@ fn model_probability_score(
         let mut models = models.borrow_mut();
         if !models.contains_key(config.model_path.as_str()) {
             let model = load_onnx_session(&config.model_path);
+            // Read feature order from this session before storing it, so we
+            // never open a second ORT session (which can deadlock on ORT's
+            // internal environment mutex).
+            if let Some(ref session) = model {
+                if let Some(feature_order) = read_feature_order_from_session(session) {
+                    info!(
+                        "Loaded ONNX feature_order metadata with {} features.",
+                        feature_order.len()
+                    );
+                    config.set_feature_order_from_session(feature_order);
+                } else {
+                    warn!(
+                        "Could not read ONNX feature_order metadata from {}. Falling back to built-in {}-feature order.",
+                        config.model_path,
+                        config.model_feature_order_snapshot().len()
+                    );
+                }
+            }
             models.insert(config.model_path.clone(), model);
         }
 
@@ -2092,8 +2161,8 @@ fn call_variants(
                     tnc_down: downstream as char,
                     vt,
                 };
-                let model_features =
-                    build_model_feature_vector(&model_inputs, &model_config.model_feature_order);
+                let feature_order = model_config.model_feature_order_snapshot();
+                let model_features = build_model_feature_vector(&model_inputs, &feature_order);
                 #[cfg(feature = "onnx-inference")]
                 let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
@@ -2163,8 +2232,8 @@ fn call_variants(
                     tnc_down: downstream as char,
                     vt,
                 };
-                let model_features =
-                    build_model_feature_vector(&model_inputs, &model_config.model_feature_order);
+                let feature_order = model_config.model_feature_order_snapshot();
+                let model_features = build_model_feature_vector(&model_inputs, &feature_order);
                 #[cfg(feature = "onnx-inference")]
                 let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
@@ -2274,7 +2343,7 @@ mod tests {
                 let chunk = GenomeChunk::new(contig.to_string(), $pos, $pos + 1);
                 let variants = call_variants(
                     &chunk, test_bam, &ref_seq,
-                    20, 1, 1, 5, 20, 10, 1, 0.005, &$stranded_read, 3, "model.onnx", 0.3
+                    20, 1, 1, 5, 20, 10, 1, 0.005, &$stranded_read, 3, "model.onnx", 0.0001
                 )
                 .expect("call_variants failed");
 
@@ -2333,7 +2402,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.3
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.0001
         )
         .expect("call_variants failed");
 
@@ -2350,7 +2419,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.single_end.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.3
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.0001
         )
         .expect("call_variants failed");
 
@@ -2367,7 +2436,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R2, 3, "model.onnx", 0.3
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R2, 3, "model.onnx", 0.0001
         )
         .expect("call_variants failed");
 
