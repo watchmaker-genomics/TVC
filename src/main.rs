@@ -19,6 +19,8 @@ use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
+#[cfg(feature = "onnx-inference")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -39,25 +41,10 @@ thread_local! {
     static THREAD_LOCAL_ONNX_MODELS: RefCell<HashMap<String, Option<OrtSession>>> = RefCell::new(HashMap::new());
 }
 
+static CLI_FEATURE_ORDER_PATH: OnceLock<Option<String>> = OnceLock::new();
+
 const MODEL_TNC_BASES: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
 const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
-
-// This must match the exported ONNX model input column order.
-// NUMERIC_FEATURES + engineered terms + one-hot categorical dummies.
-const MODEL_FEATURE_ORDER: [&str; 53] = [
-    "DP", "AO", "ER", "PR",
-    "MFR", "MFA", "BFR", "BFA",
-    "AMQR", "AMQA", "ABQR", "ABQA",
-    "REDR", "REDA", "ISR", "ISA",
-    "FWDP", "REVP", "LLE", "SLE",
-    "REFC", "AMPR", "MFC", "ARL",
-    "FWD", "REV", "TOT",
-    "AF", "MQ_diff", "BQ_diff", "RED_diff", "IS_diff", "strand_bias",
-    "TNC_up_A", "TNC_up_C", "TNC_up_G", "TNC_up_T", "TNC_up_N",
-    "TNC_ref_A", "TNC_ref_C", "TNC_ref_G", "TNC_ref_T", "TNC_ref_N",
-    "TNC_down_A", "TNC_down_C", "TNC_down_G", "TNC_down_T", "TNC_down_N",
-    "VT_COMPLEX", "VT_DEL", "VT_INS", "VT_MNP", "VT_SNP",
-];
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum ReadNumber {
@@ -135,6 +122,9 @@ struct Args {
 
     #[arg(short = 'k', long, default_value = "model.onnx")]
     model_path: String,
+
+    #[arg(long)]
+    feature_order_path: Option<String>,
     
     #[arg(short = 'n', long, default_value_t = 0.3)]
     ml_threshold: f64,
@@ -189,6 +179,7 @@ struct Variant {
     forward_strand_count_snps: f64,
     reverse_strand_count_snps: f64,
     both_strands_count_snps: f64,
+    model_probability: f64,
 }
 
 impl Variant {
@@ -243,6 +234,7 @@ impl Variant {
         forward_strand_count_snps: f64,
         reverse_strand_count_snps: f64,
         both_strands_count_snps: f64,
+        model_probability: f64,
     ) -> Self {
         Variant {
             contig,
@@ -280,6 +272,7 @@ impl Variant {
             forward_strand_count_snps,
             reverse_strand_count_snps,
             both_strands_count_snps,
+            model_probability,
         }
     }
 
@@ -315,7 +308,7 @@ impl Variant {
         let rev_prob = self.rev_probability.max(1e-300);
 
         format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tVT={vt};CD={cd}\t\
+            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tVT={vt};CD={cd};LRP={lrp:.4}\t\
 GT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMQR:AMQA:ABQR:ABQA:REDR:REDA:ISR:ISA:\
 FWDP:REVP:LLE:SLE:REFC:AMPR:MFC:ARL:FWD:REV:TOT\t\
 {gt}:{dp}:{ao}:{er:.3E}:{up}{rb}{dn}:{pr:.3E}:{mfr:.1}:{mfa:.1}:{bfr:.1}:{bfa:.1}:\
@@ -329,6 +322,7 @@ FWDP:REVP:LLE:SLE:REFC:AMPR:MFC:ARL:FWD:REV:TOT\t\
             qual  = self.score.round(),
             vt    = self.infer_variant_type(),
             cd    = cd,
+            lrp   = self.model_probability,
             gt    = self.genotype,
             dp    = self.depth,
             ao    = self.alt_counts,
@@ -766,6 +760,7 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
         {}\n\
 ##INFO=<ID=VT,Number=1,Type=String,Description=\"Variant Type\">\n\
 ##INFO=<ID=CD,Number=1,Type=String,Description=\"TVC Call Directive\">\n\
+##INFO=<ID=LRP,Number=1,Type=Float,Description=\"ML model probability for this call\">\n\
 ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
 ##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n\
 ##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n\
@@ -890,6 +885,8 @@ fn infer_variant_type_from_alleles(reference: &str, alt: &str) -> &'static str {
 #[derive(Debug)]
 struct ModelInferenceConfig {
     model_path: String,
+    #[cfg(feature = "onnx-inference")]
+    feature_order_path: Option<String>,
     threshold: f64,
     model_exists: bool,
     /// Populated from the built-in constant at construction time.
@@ -957,14 +954,78 @@ struct ModelFeatureInputs {
     vt: &'static str,
 }
 
+fn canonical_base(base: char) -> char {
+    match base.to_ascii_uppercase() {
+        'A' | 'C' | 'G' | 'T' | 'N' => base.to_ascii_uppercase(),
+        _ => 'N',
+    }
+}
+
 fn default_model_feature_order() -> Vec<String> {
-    MODEL_FEATURE_ORDER.iter().map(|s| (*s).to_string()).collect()
+    let mut order = vec![
+        "DP", "AO", "ER", "PR",
+        "MFR", "MFA", "BFR", "BFA",
+        "AMQR", "AMQA", "ABQR", "ABQA",
+        "REDR", "REDA", "ISR", "ISA",
+        "FWDP", "REVP", "LLE", "SLE",
+        "REFC", "AMPR", "MFC", "ARL",
+        "FWD", "REV", "TOT",
+        "AF", "MQ_diff", "BQ_diff", "RED_diff", "IS_diff", "strand_bias",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect::<Vec<_>>();
+
+    // Fallback order when no metadata/sidecar is present.
+    // Keep broad compatibility by including TNC_up triplets.
+    for b in MODEL_TNC_BASES {
+        for r in MODEL_TNC_BASES {
+            for d in MODEL_TNC_BASES {
+                order.push(format!("TNC_up_{}{}{}", b, r, d));
+            }
+        }
+    }
+    for b in MODEL_TNC_BASES {
+        order.push(format!("TNC_ref_{}", b));
+    }
+    for b in MODEL_TNC_BASES {
+        order.push(format!("TNC_down_{}", b));
+    }
+
+    for vt in MODEL_VT_VALUES {
+        order.push(format!("VT_{}", vt));
+    }
+
+    order
+}
+
+#[cfg(feature = "onnx-inference")]
+fn derive_width_matched_feature_order(base_order: &[String], expected_width: usize) -> Vec<String> {
+    if expected_width == base_order.len() {
+        return base_order.to_vec();
+    }
+
+    if expected_width < base_order.len() {
+        return base_order[..expected_width].to_vec();
+    }
+
+    let mut derived = base_order.to_vec();
+    let pad_count = expected_width - base_order.len();
+    for idx in 0..pad_count {
+        derived.push(format!("__PAD_{}", idx + 1));
+    }
+    derived
 }
 
 fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static ModelInferenceConfig {
     static CONFIG: OnceLock<ModelInferenceConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let model_path = model_path.to_string();
+        #[cfg(feature = "onnx-inference")]
+        let feature_order_path = CLI_FEATURE_ORDER_PATH
+            .get()
+            .cloned()
+            .flatten();
         let model_exists = Path::new(&model_path).exists();
         let model_feature_order = default_model_feature_order();
 
@@ -989,6 +1050,8 @@ fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static Model
 
         ModelInferenceConfig {
             model_path,
+            #[cfg(feature = "onnx-inference")]
+            feature_order_path,
             threshold: ml_threshold,
             model_exists,
             model_feature_order: RwLock::new(model_feature_order),
@@ -1035,10 +1098,7 @@ fn ensure_onnx_runtime_initialized() {
 /// Build model input features in a stable order.
 ///
 /// IMPORTANT: keep the order in sync with model training.
-fn build_model_feature_vector(
-    inputs: &ModelFeatureInputs,
-    feature_order: &[String],
-) -> Vec<f32> {
+fn build_model_feature_map(inputs: &ModelFeatureInputs) -> HashMap<String, f64> {
     let af = if inputs.depth > 0.0 {
         inputs.alt_counts / inputs.depth
     } else {
@@ -1050,78 +1110,67 @@ fn build_model_feature_vector(
     let is_diff = inputs.avg_alt_ins - inputs.avg_ref_ins;
     let strand_bias = (inputs.fwd_probability - inputs.rev_probability).abs();
 
-    let mut values = HashMap::<&str, f64>::new();
-    values.insert("DP", inputs.depth);
-    values.insert("AO", inputs.alt_counts);
-    values.insert("ER", inputs.error_rate);
-    values.insert("PR", inputs.caller_probability);
-    values.insert("MFR", inputs.mapq_filtered_ref);
-    values.insert("MFA", inputs.mapq_filtered_alt);
-    values.insert("BFR", inputs.bq_filtered_ref);
-    values.insert("BFA", inputs.bq_filtered_alt);
-    values.insert("AMQR", inputs.average_ref_mapq);
-    values.insert("AMQA", inputs.average_alt_mapq);
-    values.insert("ABQR", inputs.average_ref_bq);
-    values.insert("ABQA", inputs.average_alt_bq);
-    values.insert("REDR", inputs.avg_ref_dist);
-    values.insert("REDA", inputs.avg_alt_dist);
-    values.insert("ISR", inputs.avg_ref_ins);
-    values.insert("ISA", inputs.avg_alt_ins);
-    values.insert("FWDP", inputs.fwd_probability);
-    values.insert("REVP", inputs.rev_probability);
-    values.insert("LLE", inputs.large_entropy);
-    values.insert("SLE", inputs.small_entropy);
-    values.insert("REFC", inputs.read_end_filtered_count);
-    values.insert("AMPR", inputs.avg_mismatch_per_read);
-    values.insert("MFC", inputs.mismatch_filtered_count);
-    values.insert("ARL", inputs.avg_read_length);
-    values.insert("FWD", inputs.fwd_count);
-    values.insert("REV", inputs.rev_count);
-    values.insert("TOT", inputs.total_count);
-    values.insert("AF", af);
-    values.insert("MQ_diff", mq_diff);
-    values.insert("BQ_diff", bq_diff);
-    values.insert("RED_diff", red_diff);
-    values.insert("IS_diff", is_diff);
-    values.insert("strand_bias", strand_bias);
+    let mut values = HashMap::<String, f64>::new();
+    values.insert("DP".to_string(), inputs.depth);
+    values.insert("AO".to_string(), inputs.alt_counts);
+    values.insert("ER".to_string(), inputs.error_rate);
+    values.insert("PR".to_string(), inputs.caller_probability);
+    values.insert("MFR".to_string(), inputs.mapq_filtered_ref);
+    values.insert("MFA".to_string(), inputs.mapq_filtered_alt);
+    values.insert("BFR".to_string(), inputs.bq_filtered_ref);
+    values.insert("BFA".to_string(), inputs.bq_filtered_alt);
+    values.insert("AMQR".to_string(), inputs.average_ref_mapq);
+    values.insert("AMQA".to_string(), inputs.average_alt_mapq);
+    values.insert("ABQR".to_string(), inputs.average_ref_bq);
+    values.insert("ABQA".to_string(), inputs.average_alt_bq);
+    values.insert("REDR".to_string(), inputs.avg_ref_dist);
+    values.insert("REDA".to_string(), inputs.avg_alt_dist);
+    values.insert("ISR".to_string(), inputs.avg_ref_ins);
+    values.insert("ISA".to_string(), inputs.avg_alt_ins);
+    values.insert("FWDP".to_string(), inputs.fwd_probability);
+    values.insert("REVP".to_string(), inputs.rev_probability);
+    values.insert("LLE".to_string(), inputs.large_entropy);
+    values.insert("SLE".to_string(), inputs.small_entropy);
+    values.insert("REFC".to_string(), inputs.read_end_filtered_count);
+    values.insert("AMPR".to_string(), inputs.avg_mismatch_per_read);
+    values.insert("MFC".to_string(), inputs.mismatch_filtered_count);
+    values.insert("ARL".to_string(), inputs.avg_read_length);
+    values.insert("FWD".to_string(), inputs.fwd_count);
+    values.insert("REV".to_string(), inputs.rev_count);
+    values.insert("TOT".to_string(), inputs.total_count);
+    values.insert("AF".to_string(), af);
+    values.insert("MQ_diff".to_string(), mq_diff);
+    values.insert("BQ_diff".to_string(), bq_diff);
+    values.insert("RED_diff".to_string(), red_diff);
+    values.insert("IS_diff".to_string(), is_diff);
+    values.insert("strand_bias".to_string(), strand_bias);
 
-    let up = inputs.tnc_up.to_ascii_uppercase();
-    let rf = inputs.tnc_ref.to_ascii_uppercase();
-    let dn = inputs.tnc_down.to_ascii_uppercase();
-    for base in MODEL_TNC_BASES {
-        values.insert(
-            match base {
-                'A' => "TNC_up_A",
-                'C' => "TNC_up_C",
-                'G' => "TNC_up_G",
-                'T' => "TNC_up_T",
-                _ => "TNC_up_N",
-            },
-            if up == base { 1.0 } else { 0.0 },
-        );
-        values.insert(
-            match base {
-                'A' => "TNC_ref_A",
-                'C' => "TNC_ref_C",
-                'G' => "TNC_ref_G",
-                'T' => "TNC_ref_T",
-                _ => "TNC_ref_N",
-            },
-            if rf == base { 1.0 } else { 0.0 },
-        );
-        values.insert(
-            match base {
-                'A' => "TNC_down_A",
-                'C' => "TNC_down_C",
-                'G' => "TNC_down_G",
-                'T' => "TNC_down_T",
-                _ => "TNC_down_N",
-            },
-            if dn == base { 1.0 } else { 0.0 },
-        );
+    let up = canonical_base(inputs.tnc_up);
+    let rf = canonical_base(inputs.tnc_ref);
+    let dn = canonical_base(inputs.tnc_down);
+
+    // Training-script compatible pattern seen in exported feature_order:
+    // TNC_up_<triplet>, where triplet was parsed from the raw TNC token.
+    for b in MODEL_TNC_BASES {
+        for r in MODEL_TNC_BASES {
+            for d in MODEL_TNC_BASES {
+                values.insert(
+                    format!("TNC_up_{}{}{}", b, r, d),
+                    if [up, rf, dn] == [b, r, d] { 1.0 } else { 0.0 },
+                );
+            }
+        }
     }
 
-    let vt = inputs.vt;
+    // Also expose split TNC components for compatibility with alternate models.
+    for b in MODEL_TNC_BASES {
+        values.insert(format!("TNC_ref_{}", b), if rf == b { 1.0 } else { 0.0 });
+    }
+    for b in MODEL_TNC_BASES {
+        values.insert(format!("TNC_down_{}", b), if dn == b { 1.0 } else { 0.0 });
+    }
+
+    let vt = inputs.vt.to_ascii_uppercase();
     for vt_value in MODEL_VT_VALUES {
         values.insert(
             match vt_value {
@@ -1130,15 +1179,114 @@ fn build_model_feature_vector(
                 "INS" => "VT_INS",
                 "MNP" => "VT_MNP",
                 _ => "VT_SNP",
-            },
+            }
+            .to_string(),
             if vt == vt_value { 1.0 } else { 0.0 },
         );
     }
 
+    values
+}
+
+fn build_model_feature_vector(
+    inputs: &ModelFeatureInputs,
+    feature_order: &[String],
+) -> Vec<f32> {
+    let values = build_model_feature_map(inputs);
+
     feature_order
         .iter()
-        .map(|k| values.get(k.as_str()).copied().unwrap_or(0.0) as f32)
+        .map(|k| values.get(k).copied().unwrap_or(0.0) as f32)
         .collect()
+}
+
+#[cfg(feature = "onnx-inference")]
+fn generated_model_feature_keys() -> HashSet<String> {
+    let dummy = ModelFeatureInputs {
+        depth: 0.0,
+        alt_counts: 0.0,
+        error_rate: 0.0,
+        caller_probability: 0.0,
+        mapq_filtered_ref: 0.0,
+        mapq_filtered_alt: 0.0,
+        bq_filtered_ref: 0.0,
+        bq_filtered_alt: 0.0,
+        average_ref_mapq: 0.0,
+        average_alt_mapq: 0.0,
+        average_ref_bq: 0.0,
+        average_alt_bq: 0.0,
+        avg_ref_dist: 0.0,
+        avg_alt_dist: 0.0,
+        avg_ref_ins: 0.0,
+        avg_alt_ins: 0.0,
+        fwd_probability: 0.0,
+        rev_probability: 0.0,
+        large_entropy: 0.0,
+        small_entropy: 0.0,
+        read_end_filtered_count: 0.0,
+        avg_mismatch_per_read: 0.0,
+        mismatch_filtered_count: 0.0,
+        avg_read_length: 0.0,
+        fwd_count: 0.0,
+        rev_count: 0.0,
+        total_count: 0.0,
+        tnc_up: 'N',
+        tnc_ref: 'N',
+        tnc_down: 'N',
+        vt: "SNP",
+    };
+    build_model_feature_map(&dummy).into_keys().collect()
+}
+
+#[cfg(feature = "onnx-inference")]
+fn validate_model_feature_order(feature_order: &[String]) -> Result<(), String> {
+    let generated = generated_model_feature_keys();
+    let ordered_set: HashSet<&str> = feature_order.iter().map(|s| s.as_str()).collect();
+
+    let unsupported: Vec<String> = feature_order
+        .iter()
+        .filter(|k| !generated.contains((*k).as_str()))
+        .cloned()
+        .collect();
+
+    let unused_generated = generated
+        .iter()
+        .filter(|k| !ordered_set.contains(k.as_str()))
+        .count();
+
+    if !unsupported.is_empty() {
+        let sample = unsupported
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            "ONNX feature_order contains {} unsupported features (sample: {}).",
+            unsupported.len(),
+            sample
+        );
+    }
+
+    let unsupported_ratio = unsupported.len() as f64 / feature_order.len().max(1) as f64;
+    if unsupported_ratio >= 0.05 || unsupported.len() >= 5 {
+        return Err(format!(
+            "Model feature_order is incompatible with generated feature schema: {} unsupported of {} total features (ratio {:.1}%).",
+            unsupported.len(),
+            feature_order.len(),
+            unsupported_ratio * 100.0
+        ));
+    }
+
+    if unused_generated > 0 {
+        info!(
+            "Model feature_order uses {} / {} generated feature keys.",
+            feature_order.len() - unsupported.len(),
+            generated.len()
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "onnx-inference")]
@@ -1178,18 +1326,83 @@ fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
 #[cfg(feature = "onnx-inference")]
 fn read_feature_order_from_session(session: &OrtSession) -> Option<Vec<String>> {
     let metadata = session.metadata().ok()?;
-    let raw = metadata.custom("feature_order")?;
-    let feature_order: Vec<String> = raw
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    if feature_order.is_empty() {
-        None
-    } else {
-        Some(feature_order)
+    for key in ["feature_order", "feature_names"] {
+        let Some(raw) = metadata.custom(key) else {
+            continue;
+        };
+
+        let trimmed = raw.trim();
+
+        // Support JSON-array encoded metadata from skl2onnx exporters.
+        let feature_order: Vec<String> = if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|s| s.trim())
+                .map(|s| s.trim_matches('"'))
+                .map(|s| s.trim_matches('\''))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            trimmed
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        };
+
+        if !feature_order.is_empty() {
+            return Some(feature_order);
+        }
     }
+
+    None
+}
+
+#[cfg(feature = "onnx-inference")]
+fn read_feature_order_from_sidecar(model_path: &str, explicit_sidecar_path: Option<&str>) -> Option<Vec<String>> {
+    let model = Path::new(model_path);
+    let parent = model.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut candidates = Vec::new();
+    if let Some(explicit) = explicit_sidecar_path {
+        let explicit_trimmed = explicit.trim();
+        if !explicit_trimmed.is_empty() {
+            candidates.push(PathBuf::from(explicit_trimmed));
+        }
+    }
+    // Default fallback file when metadata is unavailable.
+    candidates.push(parent.join("feature_order.txt"));
+
+    for candidate in candidates {
+        let raw = match std::fs::read_to_string(&candidate) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+
+        let feature_order: Vec<String> = raw
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.trim_end_matches(','))
+            .filter(|line| !line.is_empty())
+            .map(|line| line.to_string())
+            .collect();
+
+        if !feature_order.is_empty() {
+            info!(
+                "Loaded ONNX feature_order from sidecar {} with {} features.",
+                candidate.display(),
+                feature_order.len()
+            );
+            return Some(feature_order);
+        }
+    }
+
+    None
 }
 
 #[cfg(feature = "onnx-inference")]
@@ -1230,36 +1443,48 @@ fn run_onnx_inference(
     if outputs.len() == 0 {
         return Err("Model returned no outputs".into());
     }
-    let output = &outputs[0];
 
-    let (_, values) = output.try_extract_tensor::<f32>()?;
-    if values.is_empty() {
-        return Err("Model output tensor is empty".into());
-    }
-
-    // Common binary classifiers emit either one probability or two class scores.
-    let probability = if values.len() == 1 {
-        values[0] as f64
-    } else {
-        let p0 = values[0] as f64;
-        let p1 = values[1] as f64;
-        let sum = p0 + p1;
-
-        if p0 >= 0.0
-            && p0 <= 1.0
-            && p1 >= 0.0
-            && p1 <= 1.0
+    let pair_to_probability = |a: f64, b: f64| -> f64 {
+        let sum = a + b;
+        if a >= 0.0
+            && a <= 1.0
+            && b >= 0.0
+            && b <= 1.0
             && (sum - 1.0).abs() < 1e-3
         {
-            p1
+            b
         } else if sum > 0.0 {
-            p1 / sum
+            b / sum
         } else {
             0.0
         }
     };
 
-    Ok(probability.clamp(0.0, 1.0))
+    // Prefer a probability matrix output (e.g. sklearn ONNX [N,2]) and use class-1 probability.
+    for (_, output) in &outputs {
+        if let Ok((_, values)) = output.try_extract_tensor::<f32>() {
+            if values.len() >= 2 {
+                return Ok(pair_to_probability(values[0] as f64, values[1] as f64).clamp(0.0, 1.0));
+            }
+        }
+    }
+
+    // Fall back to scalar probability outputs.
+    for (_, output) in &outputs {
+        if let Ok((_, values)) = output.try_extract_tensor::<f32>() {
+            if values.len() == 1 {
+                let v = values[0] as f64;
+                let p = if (0.0..=1.0).contains(&v) {
+                    v
+                } else {
+                    1.0 / (1.0 + (-v).exp())
+                };
+                return Ok(p.clamp(0.0, 1.0));
+            }
+        }
+    }
+
+    Err("Could not find a numeric probability output tensor in ONNX outputs".into())
 }
 
 #[cfg(not(feature = "onnx-inference"))]
@@ -1286,18 +1511,69 @@ fn model_probability_score(
             // never open a second ORT session (which can deadlock on ORT's
             // internal environment mutex).
             if let Some(ref session) = model {
+                let mut loaded_from_metadata = false;
+
                 if let Some(feature_order) = read_feature_order_from_session(session) {
-                    info!(
-                        "Loaded ONNX feature_order metadata with {} features.",
-                        feature_order.len()
-                    );
-                    config.set_feature_order_from_session(feature_order);
+                    if let Err(err) = validate_model_feature_order(&feature_order) {
+                        warn!(
+                            "Invalid ONNX feature metadata (feature_order/feature_names) in {} ({}). Falling back to feature_order.txt.",
+                            config.model_path,
+                            err
+                        );
+                    } else {
+                        info!(
+                            "Loaded ONNX feature_order metadata with {} features.",
+                            feature_order.len()
+                        );
+                        config.set_feature_order_from_session(feature_order);
+                        loaded_from_metadata = true;
+                    }
                 } else {
                     warn!(
-                        "Could not read ONNX feature_order metadata from {}. Falling back to built-in {}-feature order.",
-                        config.model_path,
-                        config.model_feature_order_snapshot().len()
+                        "Could not read ONNX feature metadata (feature_order/feature_names) from {}. Falling back to feature_order.txt.",
+                        config.model_path
                     );
+                }
+
+                if !loaded_from_metadata {
+                    let mut found_feature_order_txt = false;
+                    if let Some(feature_order) = read_feature_order_from_sidecar(
+                        &config.model_path,
+                        config.feature_order_path.as_deref(),
+                    ) {
+                        found_feature_order_txt = true;
+                        if let Err(err) = validate_model_feature_order(&feature_order) {
+                            warn!(
+                                "Invalid feature_order.txt fallback for {} ({}). Falling back to built-in feature order.",
+                                config.model_path,
+                                err
+                            );
+                        } else {
+                            config.set_feature_order_from_session(feature_order);
+                        }
+                    } else if let Some(expected_width) = expected_input_width(session) {
+                        let fallback_order = config.model_feature_order_snapshot();
+                        let fallback_width = fallback_order.len();
+                        if expected_width != fallback_width {
+                            let derived = derive_width_matched_feature_order(&fallback_order, expected_width);
+                            warn!(
+                                "ONNX model at {} does not carry feature_order metadata/feature_order.txt and width differs (model={}, fallback={}). Using deterministic width-matched fallback order to continue. For exact parity, re-export model with metadata key 'feature_order' or provide feature_order.txt with {} feature names.",
+                                config.model_path,
+                                expected_width,
+                                fallback_width,
+                                expected_width
+                            );
+                            config.set_feature_order_from_session(derived);
+                        }
+                    }
+
+                    if !found_feature_order_txt {
+                        warn!(
+                            "Could not load feature_order.txt for {}. Falling back to built-in {}-feature order.",
+                            config.model_path,
+                            config.model_feature_order_snapshot().len()
+                        );
+                    }
                 }
             }
             models.insert(config.model_path.clone(), model);
@@ -2167,7 +2443,7 @@ fn call_variants(
                 let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
-                if model_probability <= model_config.threshold {
+                if model_probability < model_config.threshold {
                     continue;
                 }
                 let genotype = assign_genotype(alt_counts, total_depth as usize, tnc_er);
@@ -2185,6 +2461,7 @@ fn call_variants(
                     fwd_bias, rev_bias, large_entropy, small_entropy,
                     s.read_end_filtered_count_snps, avg_mismatch, s.mismatch_filtered_count,
                     avg_read_length, fwd_count_snps, rev_count_snps, both_count_snps,
+                    model_probability,
                 ));
             }
         }
@@ -2238,7 +2515,7 @@ fn call_variants(
                 let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
-                if model_probability <= model_config.threshold {
+                if model_probability < model_config.threshold {
                     continue;
                 }
                 let genotype = assign_genotype(alt_counts, total_depth_filtered as usize, 0.05);
@@ -2256,6 +2533,7 @@ fn call_variants(
                     fwd_bias_indels, rev_bias_indels, large_entropy, small_entropy,
                     s.read_end_filtered_count_indels, avg_mismatch, s.mismatch_filtered_count,
                     avg_read_length, fwd_count_indels, rev_count_indels, both_count_indels,
+                    model_probability,
                 ));
             }
         }
@@ -2266,6 +2544,7 @@ fn call_variants(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let _ = CLI_FEATURE_ORDER_PATH.set(args.feature_order_path.clone());
     let bam_path = &args.input_bam;
     let vcf_path = &args.output_vcf;
     let min_bq = args.min_bq;
@@ -2343,7 +2622,7 @@ mod tests {
                 let chunk = GenomeChunk::new(contig.to_string(), $pos, $pos + 1);
                 let variants = call_variants(
                     &chunk, test_bam, &ref_seq,
-                    20, 1, 1, 5, 20, 10, 1, 0.005, &$stranded_read, 3, "model.onnx", 0.0001
+                    20, 1, 1, 5, 20, 10, 1, 0.005, &$stranded_read, 3, "model.onnx", 0.1
                 )
                 .expect("call_variants failed");
 
@@ -2402,7 +2681,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.0001
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.1
         )
         .expect("call_variants failed");
 
@@ -2419,7 +2698,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.single_end.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.0001
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R1, 3, "model.onnx", 0.1
         )
         .expect("call_variants failed");
 
@@ -2436,7 +2715,7 @@ mod tests {
         let variants = call_variants(
             &chunk,
             "test_assets/testing_bams/methylation_site_chr11_134755601_134755621.bam",
-            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R2, 3, "model.onnx", 0.0001
+            &ref_seq, 20, 1, 1, 5, 20, 10, 1, 0.005, &ReadNumber::R2, 3, "model.onnx", 0.1
         )
         .expect("call_variants failed");
 

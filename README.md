@@ -19,7 +19,9 @@ The tool is also available as an amd64-only container image on Amazon ECR.
 
 ## Option 3: Build from Dockerfile
 
-You can build your own docker container by navigating to the top level directory with the docker file and running `docker build -t tvc ./`
+You can build your own docker container by navigating to the top level directory with the docker file and running `docker build -t tvc ./`.
+
+The provided Dockerfile builds TVC with the `onnx-inference` feature enabled and includes `model.onnx` in the runtime image at `/opt/tvc/model.onnx`.
 
 ### Pull the latest image
 docker pull public.ecr.aws/e5r9o8m6/watchmakergenomics/tvc:latest
