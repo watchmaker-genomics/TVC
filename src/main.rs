@@ -573,11 +573,11 @@ fn find_where_to_call_variants(
 /// * `ref_base` - Reference base at the position
 /// * `upstream_base` - Base upstream of the position
 /// * `downstream_base` - Base downstream of the position
-/// * `fwd_candidates` - Set of forward strand base candidates
-/// * `fwd_counts` - Counts of forward strand base calls
-/// * `rev_candidates` - Set of reverse strand base candidates
-/// * `rev_counts` - Counts of reverse strand base calls
-/// * `total_counts` - Total counts of base calls
+/// * `forward_strand_candidates` - Set of forward strand base candidates
+/// * `forward_strand_counts` - Counts of forward strand base calls
+/// * `reverse_strand_candidates` - Set of reverse strand base candidates
+/// * `reverse_strand_counts` - Counts of reverse strand base calls
+/// * `combined_counts` - Total counts of base calls
 /// # Returns
 ///
 /// A tuple containing the selected candidates and their counts
@@ -585,28 +585,32 @@ fn select_candidates_and_counts(
     ref_base: char,
     upstream_base: char,
     downstream_base: char,
-    fwd_candidates: &HashSet<BaseCall>,
-    fwd_counts: &HashMap<BaseCall, usize>,
-    rev_candidates: &HashSet<BaseCall>,
-    rev_counts: &HashMap<BaseCall, usize>,
-    total_counts: &HashMap<BaseCall, usize>,
+    forward_strand_candidates: &HashSet<BaseCall>,
+    forward_strand_counts: &HashMap<BaseCall, usize>,
+    reverse_strand_candidates: &HashSet<BaseCall>,
+    reverse_strand_counts: &HashMap<BaseCall, usize>,
+    combined_counts: &HashMap<BaseCall, usize>,
 ) -> (HashSet<BaseCall>, HashMap<BaseCall, usize>) {
-    let directive =
-        find_where_to_call_variants(ref_base, fwd_candidates, upstream_base, downstream_base);
+    let directive = find_where_to_call_variants(
+        ref_base,
+        forward_strand_candidates,
+        upstream_base,
+        downstream_base,
+    );
 
     match directive {
         CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => {
-            (rev_candidates.clone(), rev_counts.clone())
+            (reverse_strand_candidates.clone(), reverse_strand_counts.clone())
         }
         CallingDirective::ReferenceSiteOt | CallingDirective::DenovoSiteOt => {
-            (fwd_candidates.clone(), fwd_counts.clone())
+            (forward_strand_candidates.clone(), forward_strand_counts.clone())
         }
         CallingDirective::BothStrands | CallingDirective::Indel => {
-            let intersection: HashSet<BaseCall> = fwd_candidates
-                .intersection(rev_candidates)
+            let intersection: HashSet<BaseCall> = forward_strand_candidates
+                .intersection(reverse_strand_candidates)
                 .cloned()
                 .collect();
-            (intersection, total_counts.clone())
+            (intersection, combined_counts.clone())
         }
     }
 }
@@ -770,8 +774,8 @@ fn is_stranded_read(record: &bam::Record, stranded_read: &ReadNumber) -> bool {
 #[derive(Debug)]
 /// Counts of basecalls in a pileup
 struct PileupCounts {
-    fwd: HashMap<BaseCall, usize>,
-    rev: HashMap<BaseCall, usize>,
+    forward: HashMap<BaseCall, usize>,
+    reverse: HashMap<BaseCall, usize>,
     total: HashMap<BaseCall, usize>,
 }
 /// Returns true if a slice has a repeated pattern of length n
@@ -860,10 +864,10 @@ fn compute_pileup_counts(
     indel_filter_repeat_limit: usize,
     dinuc_cutoff: usize,
 ) -> u64 {
-    pileup_counts.fwd.clear();
-    pileup_counts.rev.clear();
+    pileup_counts.forward.clear();
+    pileup_counts.reverse.clear();
     pileup_counts.total.clear();
-    let mut indel_offset = 0;
+    let mut indel_filtered_ref_count_offset = 0;
 
     for alignment in pileup.alignments() {
         let record = alignment.record();
@@ -909,18 +913,18 @@ fn compute_pileup_counts(
                 continue;
             }
 
-            let is_stranded_read_status = is_stranded_read(&record, stranded_read);
-            if (record.is_reverse() && is_stranded_read_status)
-                || (!record.is_reverse() && !is_stranded_read_status)
+            let is_target_stranded_read = is_stranded_read(&record, stranded_read);
+            if (record.is_reverse() && is_target_stranded_read)
+                || (!record.is_reverse() && !is_target_stranded_read)
             {
                 pileup_counts
-                    .rev
+                    .reverse
                     .entry(basecall.clone())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
             } else {
                 pileup_counts
-                    .fwd
+                    .forward
                     .entry(basecall.clone())
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
@@ -934,13 +938,13 @@ fn compute_pileup_counts(
             if variant_type == VariantObservation::Ref {
                 let read_seq = record.seq().as_bytes();
                 if filter_indels(&read_seq, &record, indel_filter_repeat_limit, dinuc_cutoff) {
-                    indel_offset += 1;
+                    indel_filtered_ref_count_offset += 1;
                 }
             }
         }
     }
 
-    indel_offset
+    indel_filtered_ref_count_offset
 }
 
 /// Main workflow for variant calling
@@ -1144,18 +1148,18 @@ fn call_variants(
     let mut variants = Vec::new();
 
     let mut pileup_counts = PileupCounts {
-        fwd: HashMap::with_capacity(8),
-        rev: HashMap::with_capacity(8),
+        forward: HashMap::with_capacity(8),
+        reverse: HashMap::with_capacity(8),
         total: HashMap::with_capacity(8),
     };
 
-    let mut r_one_f_counts_snps = HashMap::with_capacity(4);
-    let mut r_one_r_counts_snps = HashMap::with_capacity(4);
-    let mut r_one_f_counts_indels = HashMap::with_capacity(4);
-    let mut r_one_r_counts_indels = HashMap::with_capacity(4);
+    let mut forward_strand_snp_counts = HashMap::with_capacity(4);
+    let mut reverse_strand_snp_counts = HashMap::with_capacity(4);
+    let mut forward_strand_indel_counts = HashMap::with_capacity(4);
+    let mut reverse_strand_indel_counts = HashMap::with_capacity(4);
 
-    let mut total_counts_snps = HashMap::with_capacity(4);
-    let mut total_counts_indels = HashMap::with_capacity(4);
+    let mut combined_snp_counts = HashMap::with_capacity(4);
+    let mut combined_indel_counts = HashMap::with_capacity(4);
 
     for result in bam.pileup() {
         let pileup: Pileup = result.expect("Failed to read pileup");
@@ -1175,7 +1179,7 @@ fn call_variants(
             indel_filter_repeat_limit
         };
 
-        let indel_offset = compute_pileup_counts(
+        let indel_filtered_ref_count_offset = compute_pileup_counts(
             &pileup,
             min_bq,
             min_mapq,
@@ -1190,27 +1194,27 @@ fn call_variants(
             dinuc_cutoff,
         );
 
-        r_one_f_counts_snps.clear();
-        r_one_r_counts_snps.clear();
-        r_one_f_counts_indels.clear();
-        r_one_r_counts_indels.clear();
-        total_counts_snps.clear();
-        total_counts_indels.clear();
+        forward_strand_snp_counts.clear();
+        reverse_strand_snp_counts.clear();
+        forward_strand_indel_counts.clear();
+        reverse_strand_indel_counts.clear();
+        combined_snp_counts.clear();
+        combined_indel_counts.clear();
 
         distribute_counts(
-            &pileup_counts.fwd,
-            &mut r_one_f_counts_snps,
-            &mut r_one_f_counts_indels,
+            &pileup_counts.forward,
+            &mut forward_strand_snp_counts,
+            &mut forward_strand_indel_counts,
         );
         distribute_counts(
-            &pileup_counts.rev,
-            &mut r_one_r_counts_snps,
-            &mut r_one_r_counts_indels,
+            &pileup_counts.reverse,
+            &mut reverse_strand_snp_counts,
+            &mut reverse_strand_indel_counts,
         );
         distribute_counts(
             &pileup_counts.total,
-            &mut total_counts_snps,
-            &mut total_counts_indels,
+            &mut combined_snp_counts,
+            &mut combined_indel_counts,
         );
 
         let upstream_base = if pos > 0 {
@@ -1224,54 +1228,74 @@ fn call_variants(
             b'N'
         };
 
-        let r_one_f_candidates_snps = get_count_vec_candidates(&r_one_f_counts_snps, error_rate);
-        let r_one_r_candidates_snps = get_count_vec_candidates(&r_one_r_counts_snps, error_rate);
-        let r_one_r_candidates_indels =
-            get_count_vec_candidates(&r_one_r_counts_indels, error_rate);
-        let r_one_f_candidates_indels =
-            get_count_vec_candidates(&r_one_f_counts_indels, error_rate);
+        let forward_strand_snp_candidates =
+            get_count_vec_candidates(&forward_strand_snp_counts, error_rate);
+        let reverse_strand_snp_candidates =
+            get_count_vec_candidates(&reverse_strand_snp_counts, error_rate);
+        let reverse_strand_indel_candidates =
+            get_count_vec_candidates(&reverse_strand_indel_counts, error_rate);
+        let forward_strand_indel_candidates =
+            get_count_vec_candidates(&forward_strand_indel_counts, error_rate);
 
-        let directive_snps = find_where_to_call_variants(
+        let snp_calling_directive = find_where_to_call_variants(
             ref_base as char,
-            &r_one_f_candidates_snps,
+            &forward_strand_snp_candidates,
             upstream_base as char,
             downstream_base as char,
         );
 
-        let (candidate_snps, counts_snps) = select_candidates_and_counts(
+        let (selected_snp_candidates, selected_snp_counts) = select_candidates_and_counts(
             ref_base as char,
             upstream_base as char,
             downstream_base as char,
-            &r_one_f_candidates_snps,
-            &r_one_f_counts_snps,
-            &r_one_r_candidates_snps,
-            &r_one_r_counts_snps,
-            &total_counts_snps,
+            &forward_strand_snp_candidates,
+            &forward_strand_snp_counts,
+            &reverse_strand_snp_candidates,
+            &reverse_strand_snp_counts,
+            &combined_snp_counts,
         );
 
-        let (candidate_indels, counts_indels) = select_candidates_and_counts(
+        let (selected_indel_candidates, selected_indel_counts) = select_candidates_and_counts(
             ref_base as char,
             upstream_base as char,
             downstream_base as char,
-            &r_one_f_candidates_indels,
-            &r_one_f_counts_indels,
-            &r_one_r_candidates_indels,
-            &r_one_r_counts_indels,
-            &total_counts_indels,
+            &forward_strand_indel_candidates,
+            &forward_strand_indel_counts,
+            &reverse_strand_indel_candidates,
+            &reverse_strand_indel_counts,
+            &combined_indel_counts,
         );
 
-        let total_depth_snps = counts_snps.values().sum::<usize>() as u64;
-        let total_depth_indels = counts_indels.values().sum::<usize>() as u64;
-        let total_depth = total_depth_snps + total_depth_indels;
-        let total_depth_filtered = total_depth.saturating_sub(indel_offset);
-        let directive_indels = CallingDirective::BothStrands;
-        if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
-            for candidate in candidate_snps {
-                let alt_counts = counts_snps.get(&candidate).unwrap_or(&0);
+        // Calculate depths for SNP and INDEL genotyping
+        let snp_only_depth = selected_snp_counts.values().sum::<usize>() as u64;
+        let indel_only_depth = selected_indel_counts.values().sum::<usize>() as u64;
+
+        // For SNP genotyping, snp_only_depth includes calling directive filtering.
+        let depth_for_snp_genotyping = snp_only_depth + indel_only_depth;
+
+        // For INDEL genotyping, combined_snp_counts includes both strands
+        // This keeps accounting of ref allele counts consistent with indel_filtered_ref_count_offset.
+        let depth_for_indel_genotyping_pre_filter =
+            combined_snp_counts.values().sum::<usize>() as u64 + indel_only_depth;
+
+        // Depth is adjusted to exclude reads that meet filtering criteria.
+        let depth_for_indel_genotyping =
+            depth_for_indel_genotyping_pre_filter.saturating_sub(indel_filtered_ref_count_offset);
+
+        // Calling directive for INDELs is always BothStrands, as they are not strand-specific.
+        let indel_calling_directive = CallingDirective::BothStrands;
+        
+        if !selected_snp_candidates.is_empty() && depth_for_snp_genotyping >= min_depth as u64 {
+            for candidate in selected_snp_candidates {
+                let alt_counts = selected_snp_counts.get(&candidate).unwrap_or(&0);
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, total_depth as usize, error_rate);
+                if depth_for_snp_genotyping < *alt_counts as u64 {
+                    continue;
+                }
+                let genotype =
+                    assign_genotype(*alt_counts, depth_for_snp_genotyping as usize, error_rate);
                 if genotype.genotype == "0/0" {
                     continue;
                 }
@@ -1283,21 +1307,26 @@ fn call_variants(
                     candidate.get_alternate_allele(),
                     genotype.genotype,
                     genotype.score,
-                    total_depth as u32,
+                    depth_for_snp_genotyping as u32,
                     *alt_counts as u32,
-                    directive_snps.clone(),
+                    snp_calling_directive.clone(),
                 );
                 variants.push(variant);
             }
         }
 
-        if !candidate_indels.is_empty() && total_depth_indels >= min_depth as u64 {
-            for candidate in candidate_indels {
-                let alt_counts = counts_indels.get(&candidate).unwrap_or(&0);
+        if !selected_indel_candidates.is_empty()
+            && depth_for_indel_genotyping_pre_filter >= min_depth as u64
+        {
+            for candidate in selected_indel_candidates {
+                let alt_counts = selected_indel_counts.get(&candidate).unwrap_or(&0);
                 if *alt_counts < min_ao as usize {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, total_depth_filtered as usize, 0.05);
+                if depth_for_indel_genotyping < *alt_counts as u64 {
+                    continue;
+                }
+                let genotype = assign_genotype(*alt_counts, depth_for_indel_genotyping as usize, 0.05);
                 if genotype.genotype == "0/0" {
                     continue;
                 }
@@ -1309,9 +1338,9 @@ fn call_variants(
                     candidate.get_alternate_allele(),
                     genotype.genotype,
                     genotype.score,
-                    total_depth_filtered as u32,
+                    depth_for_indel_genotyping as u32,
                     *alt_counts as u32,
-                    directive_indels.clone(),
+                    indel_calling_directive.clone(),
                 );
                 variants.push(variant);
             }
