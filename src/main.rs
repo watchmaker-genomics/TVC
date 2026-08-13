@@ -599,12 +599,14 @@ fn select_candidates_and_counts(
     );
 
     match directive {
-        CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => {
-            (reverse_strand_candidates.clone(), reverse_strand_counts.clone())
-        }
-        CallingDirective::ReferenceSiteOt | CallingDirective::DenovoSiteOt => {
-            (forward_strand_candidates.clone(), forward_strand_counts.clone())
-        }
+        CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => (
+            reverse_strand_candidates.clone(),
+            reverse_strand_counts.clone(),
+        ),
+        CallingDirective::ReferenceSiteOt | CallingDirective::DenovoSiteOt => (
+            forward_strand_candidates.clone(),
+            forward_strand_counts.clone(),
+        ),
         CallingDirective::BothStrands | CallingDirective::Indel => {
             let intersection: HashSet<BaseCall> = forward_strand_candidates
                 .intersection(reverse_strand_candidates)
@@ -1284,7 +1286,7 @@ fn call_variants(
 
         // Calling directive for INDELs is always BothStrands, as they are not strand-specific.
         let indel_calling_directive = CallingDirective::BothStrands;
-        
+
         if !selected_snp_candidates.is_empty() && depth_for_snp_genotyping >= min_depth as u64 {
             for candidate in selected_snp_candidates {
                 let alt_counts = selected_snp_counts.get(&candidate).unwrap_or(&0);
@@ -1326,7 +1328,8 @@ fn call_variants(
                 if depth_for_indel_genotyping < *alt_counts as u64 {
                     continue;
                 }
-                let genotype = assign_genotype(*alt_counts, depth_for_indel_genotyping as usize, 0.05);
+                let genotype =
+                    assign_genotype(*alt_counts, depth_for_indel_genotyping as usize, 0.05);
                 if genotype.genotype == "0/0" {
                     continue;
                 }
