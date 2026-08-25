@@ -61,6 +61,23 @@ enum LogLevel {
     Trace,
 }
 
+#[derive(ValueEnum, Clone, Debug)]
+enum ModelMode {
+    #[value(name = "illumina-5-base")]
+    Illumina5Base,
+    #[value(name = "wmg-taps-plus")]
+    WmgTapsPlus,
+}
+
+impl ModelMode {
+    fn model_path(&self) -> &'static str {
+        match self {
+            ModelMode::Illumina5Base => "illumina_model.onnx",
+            ModelMode::WmgTapsPlus => "wmg_model.onnx",
+        }
+    }
+}
+
 impl LogLevel {
     fn as_str(&self) -> &'static str {
         match self {
@@ -123,8 +140,8 @@ struct Args {
     #[arg(short = 'l', long, value_enum, default_value_t = LogLevel::Info)]
     log_level: LogLevel,
 
-    #[arg(short = 'k', long, default_value = "model.onnx")]
-    model_path: String,
+    #[arg(long, value_enum, default_value_t = ModelMode::Illumina5Base)]
+    mode: ModelMode,
 
     #[arg(long)]
     feature_order_path: Option<String>,
@@ -2639,7 +2656,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let error_rate = args.error_rate;
     let stranded_read = &args.stranded_read;
     let indel_filter_repeat_limit = args.indel_filter_repeat_limit;
-    let model_path = &args.model_path;
+    let model_path = args.mode.model_path();
     let tumor_ml_threshold = args.tumor_ml_threshold;
     let normal_ml_threshold = args.normal_ml_threshold;
 
