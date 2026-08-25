@@ -81,6 +81,9 @@ struct Args {
     input_bam: String,
     output_vcf: String,
 
+    #[arg(long)]
+    matched_normal_bam: Option<String>,
+
     #[arg(short = 'b', long, default_value_t = 20)]
     min_bq: usize,
 
@@ -126,8 +129,11 @@ struct Args {
     #[arg(long)]
     feature_order_path: Option<String>,
     
-    #[arg(short = 'n', long, default_value_t = 0.3)]
-    ml_threshold: f64,
+    #[arg(short = 'n', long = "tumor-ml-threshold", alias = "ml-threshold", default_value_t = 0.3)]
+    tumor_ml_threshold: f64,
+
+    #[arg(long, default_value_t = 0.3)]
+    normal_ml_threshold: f64,
 }
 
 /// Representation of a genomic variant
@@ -887,7 +893,6 @@ struct ModelInferenceConfig {
     model_path: String,
     #[cfg(feature = "onnx-inference")]
     feature_order_path: Option<String>,
-    threshold: f64,
     model_exists: bool,
     /// Populated from the built-in constant at construction time.
     /// On first ONNX session load, overwritten once via `set_feature_order_from_session`
@@ -1017,7 +1022,7 @@ fn derive_width_matched_feature_order(base_order: &[String], expected_width: usi
     derived
 }
 
-fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static ModelInferenceConfig {
+fn model_inference_config(model_path: &str) -> &'static ModelInferenceConfig {
     static CONFIG: OnceLock<ModelInferenceConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let model_path = model_path.to_string();
@@ -1052,7 +1057,6 @@ fn model_inference_config(model_path: &str, ml_threshold: f64) -> &'static Model
             model_path,
             #[cfg(feature = "onnx-inference")]
             feature_order_path,
-            threshold: ml_threshold,
             model_exists,
             model_feature_order: RwLock::new(model_feature_order),
             #[cfg(feature = "onnx-inference")]
@@ -1967,7 +1971,7 @@ fn distribute_counts(
 /// # Returns
 /// Ok(()) if workflow completes successfully, error otherwise
 pub fn workflow(
-    bam_path: &str,
+    tumor_bam_path: &str,
     ref_path: &str,
     vcf_path: &str,
     min_bq: usize,
@@ -1983,10 +1987,15 @@ pub fn workflow(
     stranded_read: &ReadNumber,
     indel_filter_repeat_limit: usize,
     model_path: &str,
-    ml_threshold: f64,
+    tumor_ml_threshold: f64,
+    matched_normal_bam_path: Option<&str>,
+    normal_ml_threshold: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TVC workflow");
-    validate_fai_and_bam(ref_path, bam_path)?;
+    validate_fai_and_bam(ref_path, tumor_bam_path)?;
+    if let Some(normal_bam_path) = matched_normal_bam_path {
+        validate_fai_and_bam(ref_path, normal_bam_path)?;
+    }
 
     info!("Reading reference sequences");
     let ref_reader = faidx::Reader::from_path(ref_path)?;
@@ -2025,7 +2034,7 @@ pub fn workflow(
         .num_threads(num_threads)
         .build()?;
 
-    let all_variants: Vec<Variant> = pool.install(|| {
+    let all_tumor_variants: Vec<Variant> = pool.install(|| {
         chunks
             .par_iter()
             .map(|chunk| {
@@ -2037,7 +2046,7 @@ pub fn workflow(
 
                 let res = call_variants(
                     chunk,
-                    bam_path,
+                    tumor_bam_path,
                     seq_name_to_seq
                         .get(&chunk.contig)
                         .expect("Contig not found in reference"),
@@ -2052,7 +2061,7 @@ pub fn workflow(
                     stranded_read,
                     indel_filter_repeat_limit,
                     model_path,
-                    ml_threshold,
+                    tumor_ml_threshold,
                 )
                 .unwrap_or_else(|_e| Vec::new());
                 open_files_counter.fetch_sub(1, Ordering::SeqCst);
@@ -2063,7 +2072,76 @@ pub fn workflow(
             .collect()
     });
 
-    pb.finish_with_message("Variant calling complete. Wrapping up.");
+    pb.finish_with_message("Tumor variant calling complete. Wrapping up.");
+
+    let mut normal_variant_keys: HashSet<(String, u32, String, String)> = HashSet::new();
+    if let Some(normal_bam_path) = matched_normal_bam_path {
+        info!(
+            "Matched normal BAM provided. Calling normal variants with ML threshold {} and using them to filter tumor calls.",
+            normal_ml_threshold
+        );
+
+        let pb_normal = ProgressBar::new(chunks.len() as u64);
+        pb_normal.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} normal chunks processed",
+                )?
+                .progress_chars("#>-"),
+        );
+
+        let all_normal_variants: Vec<Variant> = pool.install(|| {
+            chunks
+                .par_iter()
+                .map(|chunk| {
+                    while open_files_counter.load(Ordering::SeqCst) >= max_open_files {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+
+                    open_files_counter.fetch_add(1, Ordering::SeqCst);
+
+                    let res = call_variants(
+                        chunk,
+                        normal_bam_path,
+                        seq_name_to_seq
+                            .get(&chunk.contig)
+                            .expect("Contig not found in reference"),
+                        min_bq,
+                        min_mapq,
+                        min_depth,
+                        end_of_read_cutoff,
+                        indel_end_of_read_cutoff,
+                        max_mismatches,
+                        min_ao,
+                        error_rate,
+                        stranded_read,
+                        indel_filter_repeat_limit,
+                        model_path,
+                        normal_ml_threshold,
+                    )
+                    .unwrap_or_else(|_e| Vec::new());
+                    open_files_counter.fetch_sub(1, Ordering::SeqCst);
+                    pb_normal.inc(1);
+                    res
+                })
+                .flatten()
+                .collect()
+        });
+
+        pb_normal.finish_with_message("Normal variant calling complete.");
+
+        normal_variant_keys = all_normal_variants
+            .into_iter()
+            .map(|v| (v.contig, v.pos, v.reference, v.alt))
+            .collect();
+    }
+
+    let mut all_variants: Vec<Variant> = all_tumor_variants;
+    if !normal_variant_keys.is_empty() {
+        all_variants.retain(|v| {
+            !normal_variant_keys.contains(&(v.contig.clone(), v.pos, v.reference.clone(), v.alt.clone()))
+        });
+    }
 
     // Sort all variants by contig and position
     let mut sorted_variants = all_variants;
@@ -2074,7 +2152,7 @@ pub fn workflow(
 
     // Write to VCF
     let mut vcf_file = File::create(vcf_path)?;
-    let header = bam::Reader::from_path(bam_path)?.header().to_owned();
+    let header = bam::Reader::from_path(tumor_bam_path)?.header().to_owned();
     vcf_file.write_all(get_vcf_header(&header).as_bytes())?;
 
     for variant in sorted_variants {
@@ -2256,7 +2334,7 @@ fn call_variants(
     model_path: &str,
     ml_threshold: f64,
 ) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
-    let model_config = model_inference_config(model_path, ml_threshold);
+    let model_config = model_inference_config(model_path);
 
     let error_map = compute_tnc_error_rates(
         chunk, bam_path, ref_seq, min_bq, min_mapq, min_depth,
@@ -2443,7 +2521,7 @@ fn call_variants(
                 let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
-                if model_probability < model_config.threshold {
+                if model_probability < ml_threshold {
                     continue;
                 }
                 let genotype = assign_genotype(alt_counts, total_depth as usize, tnc_er);
@@ -2515,7 +2593,7 @@ fn call_variants(
                 let model_probability = model_probability_score(model_config, &model_features);
                 #[cfg(not(feature = "onnx-inference"))]
                 let model_probability = model_probability_score(model_config, &model_features);
-                if model_probability < model_config.threshold {
+                if model_probability < ml_threshold {
                     continue;
                 }
                 let genotype = assign_genotype(alt_counts, total_depth_filtered as usize, 0.05);
@@ -2545,7 +2623,8 @@ fn call_variants(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let _ = CLI_FEATURE_ORDER_PATH.set(args.feature_order_path.clone());
-    let bam_path = &args.input_bam;
+    let tumor_bam_path = &args.input_bam;
+    let matched_normal_bam_path = args.matched_normal_bam.as_deref();
     let vcf_path = &args.output_vcf;
     let min_bq = args.min_bq;
     let min_mapq = args.min_mapq;
@@ -2561,7 +2640,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stranded_read = &args.stranded_read;
     let indel_filter_repeat_limit = args.indel_filter_repeat_limit;
     let model_path = &args.model_path;
-    let ml_threshold = args.ml_threshold;
+    let tumor_ml_threshold = args.tumor_ml_threshold;
+    let normal_ml_threshold = args.normal_ml_threshold;
 
     let level = args.log_level.as_str(); // use the enum value from clap
 
@@ -2571,7 +2651,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     workflow(
-        bam_path,
+        tumor_bam_path,
         ref_path,
         vcf_path,
         min_bq,
@@ -2587,7 +2667,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stranded_read,
         indel_filter_repeat_limit,
         model_path,
-        ml_threshold,
+        tumor_ml_threshold,
+        matched_normal_bam_path,
+        normal_ml_threshold,
     )?;
 
     Ok(())
@@ -2724,6 +2806,72 @@ mod tests {
             in_range.len(), 2,
             "Since R2 was flipped the caller should emit 2 variants, got {}",
             in_range.len()
+        );
+    }
+
+    #[test]
+    fn test_matched_normal_filters_identical_tumor_calls() {
+        let contig = "chr11";
+        let ref_seq = load_ref_seq(contig);
+        let chunk = GenomeChunk::new(contig.to_string(), 134749303, 134749304);
+        let bam = "test_assets/testing_bams/denovo_ot_chr11_134749303_A_G_het.bam";
+
+        let tumor_variants = call_variants(
+            &chunk,
+            bam,
+            &ref_seq,
+            20,
+            1,
+            1,
+            5,
+            20,
+            10,
+            1,
+            0.005,
+            &ReadNumber::R1,
+            3,
+            "model.onnx",
+            0.1,
+        )
+        .expect("tumor call_variants failed");
+
+        assert!(
+            !tumor_variants.is_empty(),
+            "Expected at least one tumor variant before matched-normal filtering"
+        );
+
+        let normal_variants = call_variants(
+            &chunk,
+            bam,
+            &ref_seq,
+            20,
+            1,
+            1,
+            5,
+            20,
+            10,
+            1,
+            0.005,
+            &ReadNumber::R1,
+            3,
+            "model.onnx",
+            0.1,
+        )
+        .expect("normal call_variants failed");
+
+        let normal_keys: std::collections::HashSet<(String, u32, String, String)> = normal_variants
+            .into_iter()
+            .map(|v| (v.contig, v.pos, v.reference, v.alt))
+            .collect();
+
+        let mut filtered_tumor = tumor_variants;
+        filtered_tumor.retain(|v| {
+            !normal_keys.contains(&(v.contig.clone(), v.pos, v.reference.clone(), v.alt.clone()))
+        });
+
+        assert!(
+            filtered_tumor.is_empty(),
+            "Expected no tumor variants after matched-normal filtering when using identical BAMs"
         );
     }
 }
