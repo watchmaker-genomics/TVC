@@ -1,6 +1,6 @@
 use clap::Parser;
 use clap::ValueEnum;
-
+// REVIEW: is the cfg feature needed all three times?
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use rust_htslib::bam::pileup::Alignment;
@@ -14,37 +14,47 @@ use statrs::distribution::{Binomial, Discrete, DiscreteCDF};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
-#[cfg(feature = "onnx-inference")]
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::RwLock;
-use std::thread;
-use std::time::Duration;
 use tracing_subscriber::fmt as subscriber_fmt;
 use tracing_subscriber::EnvFilter;
 use tracing::info;
 #[cfg(feature = "onnx-inference")]
 use tracing::warn;
-
+// REVIEW: should some of this be moved
 #[cfg(feature = "onnx-inference")]
 use ort::{session::Session as OrtSession, value::TensorRef};
 
 #[cfg(feature = "onnx-inference")]
+// NOTE: per thread storage of ONNX models to avoid contention and allow for parallel inference
 thread_local! {
     static THREAD_LOCAL_ONNX_MODELS: RefCell<HashMap<String, Option<OrtSession>>> = RefCell::new(HashMap::new());
 }
-
-static CLI_FEATURE_ORDER_PATH: OnceLock<Option<String>> = OnceLock::new();
-
+#[cfg(feature = "onnx-inference")]
 const MODEL_TNC_BASES: [char; 5] = ['A', 'C', 'G', 'T', 'N'];
+#[cfg(feature = "onnx-inference")]
 const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
+
+// ---------------------------------------------------------------------------
+// CLI and configuration
+// ---------------------------------------------------------------------------
+
+/// Scalar (non-one-hot) features the caller can generate for a model.
+/// IMPORTANT: names must match those used in `build_model_feature_map`.
+#[cfg(feature = "onnx-inference")]
+const BASE_FEATURE_NAMES: &[&str] = &[
+    "DP", "AO", "ER", "PR",
+    "MFR", "MFA", "BFR", "BFA",
+    "AMQR", "AMQA", "ABQR", "ABQA",
+    "REDR", "REDA", "ISR", "ISA",
+    "FWDP", "REVP", "LLE", "SLE",
+    "REFC", "AMPR", "MFC", "ARL",
+    "FWD", "REV", "TOT",
+    "AF", "MQ_diff", "BQ_diff", "RED_diff", "IS_diff", "strand_bias",
+];
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum ReadNumber {
@@ -126,13 +136,10 @@ struct Args {
     #[arg(short = 'k', long, default_value = "model.onnx")]
     model_path: String,
 
-    #[arg(long)]
-    feature_order_path: Option<String>,
-    
-    #[arg(short = 'n', long = "tumor-ml-threshold", alias = "ml-threshold", default_value_t = 0.3)]
+    #[arg(short = 'n', long = "tumor-ml-threshold", alias = "ml-threshold", default_value_t = 0.99)]
     tumor_ml_threshold: f64,
 
-    #[arg(long, default_value_t = 0.3)]
+    #[arg(long, default_value_t = 0.00)]
     normal_ml_threshold: f64,
 }
 
@@ -148,6 +155,9 @@ struct Args {
 /// * `depth` - Read depth at the variant position
 /// * `alt_counts` - Count of reads supporting the alternate allele
 /// * `calling_directive` - Calling directive for the variant caller
+///
+/// The remaining fields are the per-site features reported in the VCF FORMAT
+/// column and fed to the ML model.
 #[derive(Clone, Debug)]
 struct Variant {
     contig: String,
@@ -167,7 +177,7 @@ struct Variant {
     bq_filtered_ref: f64,
     bq_filtered_alt: f64,
     average_ref_mapq: f64,
-    average_alt_mapq: f64, 
+    average_alt_mapq: f64,
     average_ref_bq: f64,
     average_alt_bq: f64,
     avg_ref_dist_from_read_end: f64,
@@ -189,102 +199,9 @@ struct Variant {
 }
 
 impl Variant {
-    /// Create a new Variant instance
-    ///
-    /// # Arguments
-    /// * `contig` - Chromosome or contig name
-    /// * `pos` - 1-based position of the variant
-    /// * `reference` - Reference allele
-    /// * `alt` - Alternate allele
-    /// * `genotype` - Genotype string (e.g., "0/1")
-    /// * `score` - Phred-scaled quality score
-    /// * `depth` - Read depth at the variant position
-    /// * `alt_counts` - Count of reads supporting the alternate allele
-    /// * `calling_directive` - Calling directive for the variant caller
-    ///
-    /// # Returns
-    /// A new Variant instance
-    fn new(
-        contig: String,
-        pos: u32,
-        reference: String,
-        alt: String,
-        genotype: String,
-        score: f64,
-        depth: u32,
-        alt_counts: u32,
-        calling_directive: CallingDirective,
-        error_rate: f64,
-        tnc: TrinucleotideContext,
-        probability: f64,
-        mapq_filtered_ref: f64,
-        mapq_filtered_alt: f64,
-        bq_filtered_ref: f64,
-        bq_filtered_alt: f64,
-        average_ref_mapq: f64,
-        average_alt_mapq: f64,
-        average_ref_bq: f64,
-        average_alt_bq: f64,
-        avg_ref_dist_from_read_end: f64,
-        avg_alt_dist_from_read_end: f64,
-        avg_ref_insert_size: f64,
-        avg_alt_insert_size: f64,
-        fwd_probability: f64,
-        rev_probability: f64,
-        large_local_entropy: f64,
-        small_local_entropy: f64,
-        read_end_filtered_count: f64,
-        avg_mismatch_per_read: f64,
-        mismatch_filtered_count: f64,
-        avg_read_length: f64,
-        forward_strand_count_snps: f64,
-        reverse_strand_count_snps: f64,
-        both_strands_count_snps: f64,
-        model_probability: f64,
-    ) -> Self {
-        Variant {
-            contig,
-            pos,
-            reference,
-            alt,
-            genotype,
-            score,
-            depth,
-            alt_counts,
-            calling_directive,
-            error_rate,
-            tnc,
-            probability,
-            mapq_filtered_ref,
-            mapq_filtered_alt,
-            bq_filtered_ref,
-            bq_filtered_alt,
-            average_ref_mapq,
-            average_alt_mapq,
-            average_ref_bq,
-            average_alt_bq,
-            avg_ref_dist_from_read_end,
-            avg_alt_dist_from_read_end,
-            avg_ref_insert_size,
-            avg_alt_insert_size,
-            fwd_probability,
-            rev_probability,
-            large_local_entropy,
-            small_local_entropy,
-            read_end_filtered_count,
-            avg_mismatch_per_read,
-            mismatch_filtered_count,
-            avg_read_length,
-            forward_strand_count_snps,
-            reverse_strand_count_snps,
-            both_strands_count_snps,
-            model_probability,
-        }
-    }
-
     /// Infer the type of variant based on reference and alternate alleles
     ///
-    // # Returns
+    /// # Returns
     /// A string representing the variant type (e.g., "SNP", "INS", "DEL", "MNP", "COMPLEX")
     fn infer_variant_type(&self) -> &'static str {
         let rlen = self.reference.len();
@@ -416,7 +333,6 @@ enum CallingDirective {
 /// * `Insertion` - Insertion variant
 /// * `Deletion` - Deletion variant
 /// * `Ref` - Reference allele
-/// * `Complex` - Complex variant
 enum VariantObservation {
     Snp,
     Insertion,
@@ -481,18 +397,14 @@ impl BaseCall {
     }
 
     fn check_variant_type(&self) -> VariantObservation {
-        if self.insertion_bases.is_empty() && self.deleted_bases.is_empty() {
-            if self.ref_base != self.base {
-                VariantObservation::Snp
-            } else {
-                VariantObservation::Ref
-            }
-        } else if !self.insertion_bases.is_empty() {
+        if !self.insertion_bases.is_empty() {
             VariantObservation::Insertion
         } else if !self.deleted_bases.is_empty() {
             VariantObservation::Deletion
+        } else if self.ref_base != self.base {
+            VariantObservation::Snp
         } else {
-            panic!("Unexpected variant observed");
+            VariantObservation::Ref
         }
     }
 
@@ -523,22 +435,6 @@ impl BaseCall {
     }
 }
 
-impl fmt::Display for BaseCall {
-    /// Format the BaseCall for display
-    ///
-    /// # Returns
-    /// A formatted string representation of the BaseCall
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Base: {}\tDeleted: {}\tInserted: {}",
-            self.base,
-            String::from_utf8_lossy(&self.deleted_bases),
-            String::from_utf8_lossy(&self.insertion_bases)
-        )
-    }
-}
-
 impl PartialEq for BaseCall {
     /// Compare two BaseCall instances for equality
     ///
@@ -564,6 +460,10 @@ impl Hash for BaseCall {
         self.insertion_bases.hash(state);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Genome and BAM utilities
+// ---------------------------------------------------------------------------
 
 /// A chunk of the genome for processing
 ///
@@ -659,6 +559,10 @@ fn validate_fai_and_bam(
     }
     Ok(())
 }
+// ---------------------------------------------------------------------------
+// Variant selection and VCF output
+// ---------------------------------------------------------------------------
+
 /// Determine the calling directive based on reference and alternate bases
 ///
 /// # Arguments
@@ -696,49 +600,6 @@ fn find_where_to_call_variants(
         CallingDirective::DenovoSiteOt
     } else {
         CallingDirective::BothStrands
-    }
-}
-/// Select candidates and counts based on calling directive
-///
-/// # Arguments
-/// * `ref_base` - Reference base at the position
-/// * `upstream_base` - Base upstream of the position
-/// * `downstream_base` - Base downstream of the position
-/// * `fwd_candidates` - Set of forward strand base candidates
-/// * `fwd_counts` - Counts of forward strand base calls
-/// * `rev_candidates` - Set of reverse strand base candidates
-/// * `rev_counts` - Counts of reverse strand base calls
-/// * `total_counts` - Total counts of base calls
-/// # Returns
-///
-/// A tuple containing the selected candidates and their counts
-fn select_candidates_and_counts(
-    ref_base: char,
-    upstream_base: char,
-    downstream_base: char,
-    fwd_candidates: &HashSet<BaseCall>,
-    fwd_counts: &HashMap<BaseCall, usize>,
-    rev_candidates: &HashSet<BaseCall>,
-    rev_counts: &HashMap<BaseCall, usize>,
-    total_counts: &HashMap<BaseCall, usize>,
-    fwd_probabilities: &Vec<f64>,
-    rev_probabilities: &Vec<f64>,
-    total_probabilities: &Vec<f64>,
-) -> (HashSet<BaseCall>, HashMap<BaseCall, usize>, Vec<f64>) {
-    let directive =
-        find_where_to_call_variants(ref_base, fwd_candidates, upstream_base, downstream_base);
-    
-    match directive {
-        CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => {
-            (rev_candidates.clone(), rev_counts.clone(), rev_probabilities.clone())
-        }
-        CallingDirective::ReferenceSiteOt | CallingDirective::DenovoSiteOt => {
-            (fwd_candidates.clone(), fwd_counts.clone(), fwd_probabilities.clone())
-        }
-        CallingDirective::BothStrands | CallingDirective::Indel => {
-            let intersection: HashSet<BaseCall> = fwd_candidates.intersection(rev_candidates).cloned().collect();
-            (intersection, total_counts.clone(), total_probabilities.clone())
-        }
     }
 }
 
@@ -807,7 +668,6 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 /// * `n` - Number of trials
 /// * `k` - Number of successes
 /// * `p` - Probability of success on each trial
-/// * `right_tail_pval` - Threshold for right-tail p-value
 ///
 /// # Returns
 /// Right-tail p-value
@@ -853,6 +713,7 @@ fn get_count_vec_candidates(
 ///
 /// # Returns
 /// A Genotype instance with assigned genotype and quality score
+// REVIEW: this doesn't mean the same thing as germline
 fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype {
     let homo_ref_prob = Binomial::new(error_rate, depth as u64)
         .unwrap()
@@ -876,89 +737,23 @@ fn assign_genotype(alt_counts: usize, depth: usize, error_rate: f64) -> Genotype
     Genotype::new(gt, best_prob, total)
 }
 
-fn infer_variant_type_from_alleles(reference: &str, alt: &str) -> &'static str {
-    let rlen = reference.len();
-    let alen = alt.len();
-    match (rlen, alen) {
-        (1, 1) => "SNP",
-        (r, a) if r > 1 && a > 1 && r == a => "MNP",
-        (r, 1) if r > 1 => "DEL",
-        (1, a) if a > 1 => "INS",
-        _ => "COMPLEX",
-    }
-}
+// ---------------------------------------------------------------------------
+// ML model inference
+// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "onnx-inference"), allow(dead_code))]
 struct ModelInferenceConfig {
     model_path: String,
-    #[cfg(feature = "onnx-inference")]
-    feature_order_path: Option<String>,
     model_exists: bool,
-    /// Populated from the built-in constant at construction time.
-    /// On first ONNX session load, overwritten once via `set_feature_order_from_session`
-    /// if the model carries `feature_order` metadata.
-    model_feature_order: RwLock<Vec<String>>,
-    /// Guards the one-time write of model_feature_order from the session metadata.
+    /// Feature order the model was trained with. Set exactly once from the
+    /// model's `feature_order` metadata in the ONNX file. A model without
+    /// this metadata is rejected.
     #[cfg(feature = "onnx-inference")]
-    feature_order_loaded: OnceLock<()>,
+    feature_order: OnceLock<Vec<String>>,
 }
 
-impl ModelInferenceConfig {
-    fn model_feature_order_snapshot(&self) -> Vec<String> {
-        self.model_feature_order
-            .read()
-            .expect("model_feature_order lock poisoned")
-            .clone()
-    }
-
-    /// Overwrite model_feature_order from session metadata exactly once.
-    /// Subsequent calls (from other rayon threads hitting the same static) are no-ops.
-    #[cfg(feature = "onnx-inference")]
-    fn set_feature_order_from_session(&self, order: Vec<String>) {
-        self.feature_order_loaded.get_or_init(|| {
-            *self
-                .model_feature_order
-                .write()
-                .expect("model_feature_order lock poisoned") = order;
-        });
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ModelFeatureInputs {
-    depth: f64,
-    alt_counts: f64,
-    error_rate: f64,
-    caller_probability: f64,
-    mapq_filtered_ref: f64,
-    mapq_filtered_alt: f64,
-    bq_filtered_ref: f64,
-    bq_filtered_alt: f64,
-    average_ref_mapq: f64,
-    average_alt_mapq: f64,
-    average_ref_bq: f64,
-    average_alt_bq: f64,
-    avg_ref_dist: f64,
-    avg_alt_dist: f64,
-    avg_ref_ins: f64,
-    avg_alt_ins: f64,
-    fwd_probability: f64,
-    rev_probability: f64,
-    large_entropy: f64,
-    small_entropy: f64,
-    read_end_filtered_count: f64,
-    avg_mismatch_per_read: f64,
-    mismatch_filtered_count: f64,
-    avg_read_length: f64,
-    fwd_count: f64,
-    rev_count: f64,
-    total_count: f64,
-    tnc_up: char,
-    tnc_ref: char,
-    tnc_down: char,
-    vt: &'static str,
-}
-
+#[cfg(feature = "onnx-inference")]
 fn canonical_base(base: char) -> char {
     match base.to_ascii_uppercase() {
         'A' | 'C' | 'G' | 'T' | 'N' => base.to_ascii_uppercase(),
@@ -966,78 +761,16 @@ fn canonical_base(base: char) -> char {
     }
 }
 
-fn default_model_feature_order() -> Vec<String> {
-    let mut order = vec![
-        "DP", "AO", "ER", "PR",
-        "MFR", "MFA", "BFR", "BFA",
-        "AMQR", "AMQA", "ABQR", "ABQA",
-        "REDR", "REDA", "ISR", "ISA",
-        "FWDP", "REVP", "LLE", "SLE",
-        "REFC", "AMPR", "MFC", "ARL",
-        "FWD", "REV", "TOT",
-        "AF", "MQ_diff", "BQ_diff", "RED_diff", "IS_diff", "strand_bias",
-    ]
-    .into_iter()
-    .map(|s| s.to_string())
-    .collect::<Vec<_>>();
-
-    // Fallback order when no metadata/sidecar is present.
-    // Keep broad compatibility by including TNC_up triplets.
-    for b in MODEL_TNC_BASES {
-        for r in MODEL_TNC_BASES {
-            for d in MODEL_TNC_BASES {
-                order.push(format!("TNC_up_{}{}{}", b, r, d));
-            }
-        }
-    }
-    for b in MODEL_TNC_BASES {
-        order.push(format!("TNC_ref_{}", b));
-    }
-    for b in MODEL_TNC_BASES {
-        order.push(format!("TNC_down_{}", b));
-    }
-
-    for vt in MODEL_VT_VALUES {
-        order.push(format!("VT_{}", vt));
-    }
-
-    order
-}
-
-#[cfg(feature = "onnx-inference")]
-fn derive_width_matched_feature_order(base_order: &[String], expected_width: usize) -> Vec<String> {
-    if expected_width == base_order.len() {
-        return base_order.to_vec();
-    }
-
-    if expected_width < base_order.len() {
-        return base_order[..expected_width].to_vec();
-    }
-
-    let mut derived = base_order.to_vec();
-    let pad_count = expected_width - base_order.len();
-    for idx in 0..pad_count {
-        derived.push(format!("__PAD_{}", idx + 1));
-    }
-    derived
-}
-
 fn model_inference_config(model_path: &str) -> &'static ModelInferenceConfig {
     static CONFIG: OnceLock<ModelInferenceConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let model_path = model_path.to_string();
-        #[cfg(feature = "onnx-inference")]
-        let feature_order_path = CLI_FEATURE_ORDER_PATH
-            .get()
-            .cloned()
-            .flatten();
         let model_exists = Path::new(&model_path).exists();
-        let model_feature_order = default_model_feature_order();
 
         if model_exists {
             #[cfg(feature = "onnx-inference")]
             info!(
-                "Detected ONNX model at {}. Real ONNX inference is enabled. Feature order will be read from model metadata on first inference.",
+                "Detected ONNX model at {}. Real ONNX inference is enabled. Feature order must be present in the model metadata.",
                 model_path
             );
 
@@ -1055,12 +788,9 @@ fn model_inference_config(model_path: &str) -> &'static ModelInferenceConfig {
 
         ModelInferenceConfig {
             model_path,
-            #[cfg(feature = "onnx-inference")]
-            feature_order_path,
             model_exists,
-            model_feature_order: RwLock::new(model_feature_order),
             #[cfg(feature = "onnx-inference")]
-            feature_order_loaded: OnceLock::new(),
+            feature_order: OnceLock::new(),
         }
     })
 }
@@ -1099,62 +829,63 @@ fn ensure_onnx_runtime_initialized() {
     });
 }
 
-/// Build model input features in a stable order.
+/// Build model input features keyed by name.
 ///
-/// IMPORTANT: keep the order in sync with model training.
-fn build_model_feature_map(inputs: &ModelFeatureInputs) -> HashMap<String, f64> {
-    let af = if inputs.depth > 0.0 {
-        inputs.alt_counts / inputs.depth
-    } else {
-        0.0
-    };
-    let mq_diff = inputs.average_alt_mapq - inputs.average_ref_mapq;
-    let bq_diff = inputs.average_alt_bq - inputs.average_ref_bq;
-    let red_diff = inputs.avg_alt_dist - inputs.avg_ref_dist;
-    let is_diff = inputs.avg_alt_ins - inputs.avg_ref_ins;
-    let strand_bias = (inputs.fwd_probability - inputs.rev_probability).abs();
+/// IMPORTANT: names must stay in sync with `BASE_FEATURE_NAMES` and with model training.
+#[cfg(feature = "onnx-inference")]
+fn build_model_feature_map(v: &Variant) -> HashMap<String, f64> {
+    let depth = v.depth as f64;
+    let alt_counts = v.alt_counts as f64;
+    let af = if depth > 0.0 { alt_counts / depth } else { 0.0 };
+    let mq_diff = v.average_alt_mapq - v.average_ref_mapq;
+    let bq_diff = v.average_alt_bq - v.average_ref_bq;
+    let red_diff = v.avg_alt_dist_from_read_end - v.avg_ref_dist_from_read_end;
+    let is_diff = v.avg_alt_insert_size - v.avg_ref_insert_size;
+    let strand_bias = (v.fwd_probability - v.rev_probability).abs();
 
     let mut values = HashMap::<String, f64>::new();
-    values.insert("DP".to_string(), inputs.depth);
-    values.insert("AO".to_string(), inputs.alt_counts);
-    values.insert("ER".to_string(), inputs.error_rate);
-    values.insert("PR".to_string(), inputs.caller_probability);
-    values.insert("MFR".to_string(), inputs.mapq_filtered_ref);
-    values.insert("MFA".to_string(), inputs.mapq_filtered_alt);
-    values.insert("BFR".to_string(), inputs.bq_filtered_ref);
-    values.insert("BFA".to_string(), inputs.bq_filtered_alt);
-    values.insert("AMQR".to_string(), inputs.average_ref_mapq);
-    values.insert("AMQA".to_string(), inputs.average_alt_mapq);
-    values.insert("ABQR".to_string(), inputs.average_ref_bq);
-    values.insert("ABQA".to_string(), inputs.average_alt_bq);
-    values.insert("REDR".to_string(), inputs.avg_ref_dist);
-    values.insert("REDA".to_string(), inputs.avg_alt_dist);
-    values.insert("ISR".to_string(), inputs.avg_ref_ins);
-    values.insert("ISA".to_string(), inputs.avg_alt_ins);
-    values.insert("FWDP".to_string(), inputs.fwd_probability);
-    values.insert("REVP".to_string(), inputs.rev_probability);
-    values.insert("LLE".to_string(), inputs.large_entropy);
-    values.insert("SLE".to_string(), inputs.small_entropy);
-    values.insert("REFC".to_string(), inputs.read_end_filtered_count);
-    values.insert("AMPR".to_string(), inputs.avg_mismatch_per_read);
-    values.insert("MFC".to_string(), inputs.mismatch_filtered_count);
-    values.insert("ARL".to_string(), inputs.avg_read_length);
-    values.insert("FWD".to_string(), inputs.fwd_count);
-    values.insert("REV".to_string(), inputs.rev_count);
-    values.insert("TOT".to_string(), inputs.total_count);
+    values.insert("DP".to_string(), depth);
+    values.insert("AO".to_string(), alt_counts);
+    values.insert("ER".to_string(), v.error_rate);
+    values.insert("PR".to_string(), v.probability);
+    values.insert("MFR".to_string(), v.mapq_filtered_ref);
+    values.insert("MFA".to_string(), v.mapq_filtered_alt);
+    values.insert("BFR".to_string(), v.bq_filtered_ref);
+    values.insert("BFA".to_string(), v.bq_filtered_alt);
+    values.insert("AMQR".to_string(), v.average_ref_mapq);
+    values.insert("AMQA".to_string(), v.average_alt_mapq);
+    values.insert("ABQR".to_string(), v.average_ref_bq);
+    values.insert("ABQA".to_string(), v.average_alt_bq);
+    values.insert("REDR".to_string(), v.avg_ref_dist_from_read_end);
+    values.insert("REDA".to_string(), v.avg_alt_dist_from_read_end);
+    values.insert("ISR".to_string(), v.avg_ref_insert_size);
+    values.insert("ISA".to_string(), v.avg_alt_insert_size);
+    values.insert("FWDP".to_string(), v.fwd_probability);
+    values.insert("REVP".to_string(), v.rev_probability);
+    values.insert("LLE".to_string(), v.large_local_entropy);
+    values.insert("SLE".to_string(), v.small_local_entropy);
+    values.insert("REFC".to_string(), v.read_end_filtered_count);
+    values.insert("AMPR".to_string(), v.avg_mismatch_per_read);
+    values.insert("MFC".to_string(), v.mismatch_filtered_count);
+    values.insert("ARL".to_string(), v.avg_read_length);
+    values.insert("FWD".to_string(), v.forward_strand_count_snps);
+    values.insert("REV".to_string(), v.reverse_strand_count_snps);
+    values.insert("TOT".to_string(), v.both_strands_count_snps);
     values.insert("AF".to_string(), af);
     values.insert("MQ_diff".to_string(), mq_diff);
     values.insert("BQ_diff".to_string(), bq_diff);
     values.insert("RED_diff".to_string(), red_diff);
     values.insert("IS_diff".to_string(), is_diff);
+    // REVIEW: change this to a fisher's exact test
     values.insert("strand_bias".to_string(), strand_bias);
 
-    let up = canonical_base(inputs.tnc_up);
-    let rf = canonical_base(inputs.tnc_ref);
-    let dn = canonical_base(inputs.tnc_down);
+    let up = canonical_base(v.tnc.upstream_base as char);
+    let rf = canonical_base(v.tnc.ref_base as char);
+    let dn = canonical_base(v.tnc.downstream_base as char);
 
     // Training-script compatible pattern seen in exported feature_order:
     // TNC_up_<triplet>, where triplet was parsed from the raw TNC token.
+    // REVIEW: consider changing from TNC_up
     for b in MODEL_TNC_BASES {
         for r in MODEL_TNC_BASES {
             for d in MODEL_TNC_BASES {
@@ -1166,25 +897,10 @@ fn build_model_feature_map(inputs: &ModelFeatureInputs) -> HashMap<String, f64> 
         }
     }
 
-    // Also expose split TNC components for compatibility with alternate models.
-    for b in MODEL_TNC_BASES {
-        values.insert(format!("TNC_ref_{}", b), if rf == b { 1.0 } else { 0.0 });
-    }
-    for b in MODEL_TNC_BASES {
-        values.insert(format!("TNC_down_{}", b), if dn == b { 1.0 } else { 0.0 });
-    }
-
-    let vt = inputs.vt.to_ascii_uppercase();
+    let vt = v.infer_variant_type();
     for vt_value in MODEL_VT_VALUES {
         values.insert(
-            match vt_value {
-                "COMPLEX" => "VT_COMPLEX",
-                "DEL" => "VT_DEL",
-                "INS" => "VT_INS",
-                "MNP" => "VT_MNP",
-                _ => "VT_SNP",
-            }
-            .to_string(),
+            format!("VT_{}", vt_value),
             if vt == vt_value { 1.0 } else { 0.0 },
         );
     }
@@ -1192,11 +908,9 @@ fn build_model_feature_map(inputs: &ModelFeatureInputs) -> HashMap<String, f64> 
     values
 }
 
-fn build_model_feature_vector(
-    inputs: &ModelFeatureInputs,
-    feature_order: &[String],
-) -> Vec<f32> {
-    let values = build_model_feature_map(inputs);
+#[cfg(feature = "onnx-inference")]
+fn build_model_feature_vector(variant: &Variant, feature_order: &[String]) -> Vec<f32> {
+    let values = build_model_feature_map(variant);
 
     feature_order
         .iter()
@@ -1206,40 +920,18 @@ fn build_model_feature_vector(
 
 #[cfg(feature = "onnx-inference")]
 fn generated_model_feature_keys() -> HashSet<String> {
-    let dummy = ModelFeatureInputs {
-        depth: 0.0,
-        alt_counts: 0.0,
-        error_rate: 0.0,
-        caller_probability: 0.0,
-        mapq_filtered_ref: 0.0,
-        mapq_filtered_alt: 0.0,
-        bq_filtered_ref: 0.0,
-        bq_filtered_alt: 0.0,
-        average_ref_mapq: 0.0,
-        average_alt_mapq: 0.0,
-        average_ref_bq: 0.0,
-        average_alt_bq: 0.0,
-        avg_ref_dist: 0.0,
-        avg_alt_dist: 0.0,
-        avg_ref_ins: 0.0,
-        avg_alt_ins: 0.0,
-        fwd_probability: 0.0,
-        rev_probability: 0.0,
-        large_entropy: 0.0,
-        small_entropy: 0.0,
-        read_end_filtered_count: 0.0,
-        avg_mismatch_per_read: 0.0,
-        mismatch_filtered_count: 0.0,
-        avg_read_length: 0.0,
-        fwd_count: 0.0,
-        rev_count: 0.0,
-        total_count: 0.0,
-        tnc_up: 'N',
-        tnc_ref: 'N',
-        tnc_down: 'N',
-        vt: "SNP",
-    };
-    build_model_feature_map(&dummy).into_keys().collect()
+    let mut keys: HashSet<String> = BASE_FEATURE_NAMES.iter().map(|s| s.to_string()).collect();
+    for b in MODEL_TNC_BASES {
+        for r in MODEL_TNC_BASES {
+            for d in MODEL_TNC_BASES {
+                keys.insert(format!("TNC_up_{}{}{}", b, r, d));
+            }
+        }
+    }
+    for vt in MODEL_VT_VALUES {
+        keys.insert(format!("VT_{}", vt));
+    }
+    keys
 }
 
 #[cfg(feature = "onnx-inference")]
@@ -1328,80 +1020,51 @@ fn load_onnx_session(model_path: &str) -> Option<OrtSession> {
 }
 
 #[cfg(feature = "onnx-inference")]
-fn read_feature_order_from_session(session: &OrtSession) -> Option<Vec<String>> {
-    let metadata = session.metadata().ok()?;
-    for key in ["feature_order", "feature_names"] {
-        let Some(raw) = metadata.custom(key) else {
-            continue;
-        };
+fn parse_feature_order_from_metadata(raw: &str) -> Option<Vec<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
 
-        let trimmed = raw.trim();
+    let mut parsed = Vec::new();
 
-        // Support JSON-array encoded metadata from skl2onnx exporters.
-        let feature_order: Vec<String> = if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            trimmed
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(',')
-                .map(|s| s.trim())
-                .map(|s| s.trim_matches('"'))
-                .map(|s| s.trim_matches('\''))
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            trimmed
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
-        };
-
-        if !feature_order.is_empty() {
-            return Some(feature_order);
+    // Support JSON-array encoded metadata from skl2onnx exporters.
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        for item in trimmed
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+        {
+            let token = item.trim().trim_matches('"').trim_matches('\'');
+            if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                parsed.push(token.to_string());
+            }
+        }
+    } else {
+        for item in trimmed.split(',') {
+            let token = item.trim();
+            if !token.is_empty()
+                && !token.contains('=')
+                && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                parsed.push(token.to_string());
+            }
         }
     }
 
-    None
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
 }
 
 #[cfg(feature = "onnx-inference")]
-fn read_feature_order_from_sidecar(model_path: &str, explicit_sidecar_path: Option<&str>) -> Option<Vec<String>> {
-    let model = Path::new(model_path);
-    let parent = model.parent().unwrap_or_else(|| Path::new("."));
-
-    let mut candidates = Vec::new();
-    if let Some(explicit) = explicit_sidecar_path {
-        let explicit_trimmed = explicit.trim();
-        if !explicit_trimmed.is_empty() {
-            candidates.push(PathBuf::from(explicit_trimmed));
-        }
-    }
-    // Default fallback file when metadata is unavailable.
-    candidates.push(parent.join("feature_order.txt"));
-
-    for candidate in candidates {
-        let raw = match std::fs::read_to_string(&candidate) {
-            Ok(text) => text,
-            Err(_) => continue,
-        };
-
-        let feature_order: Vec<String> = raw
-            .lines()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.trim_end_matches(','))
-            .filter(|line| !line.is_empty())
-            .map(|line| line.to_string())
-            .collect();
-
-        if !feature_order.is_empty() {
-            info!(
-                "Loaded ONNX feature_order from sidecar {} with {} features.",
-                candidate.display(),
-                feature_order.len()
-            );
+fn read_feature_order_from_session(session: &OrtSession) -> Option<Vec<String>> {
+    let metadata = session.metadata().ok()?;
+    for key in ["feature_order", "feature_names"] {
+        let raw = metadata.custom(key)?;
+        if let Some(feature_order) = parse_feature_order_from_metadata(&raw) {
             return Some(feature_order);
         }
     }
@@ -1419,6 +1082,63 @@ fn expected_input_width(model: &OrtSession) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Determine the model's feature order from its metadata. The ONNX file must
+/// include feature_order/feature_names metadata; sidecar files are not used.
+#[cfg(feature = "onnx-inference")]
+fn resolve_feature_order(
+    session: &OrtSession,
+    config: &ModelInferenceConfig,
+) -> Result<Vec<String>, String> {
+    let from_metadata = read_feature_order_from_session(session).ok_or_else(|| {
+        format!(
+            "No feature order metadata found in model {}: ONNX metadata keys 'feature_order'/'feature_names' are required",
+            config.model_path
+        )
+    })?;
+
+    validate_model_feature_order(&from_metadata).map_err(|err| {
+        format!(
+            "Invalid ONNX feature metadata (feature_order/feature_names) in {} ({})",
+            config.model_path, err
+        )
+    })?;
+
+    info!(
+        "Loaded ONNX feature_order metadata with {} features.",
+        from_metadata.len()
+    );
+
+    if let Some(expected_width) = expected_input_width(session) {
+        if expected_width != from_metadata.len() {
+            return Err(format!(
+                "Feature order for model {} has {} features but the model expects {}",
+                config.model_path,
+                from_metadata.len(),
+                expected_width
+            ));
+        }
+    }
+
+    Ok(from_metadata)
+}
+
+/// Resolve and store the model's feature order up front so that a model
+/// without one fails the run instead of being silently mis-scored.
+#[cfg(feature = "onnx-inference")]
+fn require_model_feature_order(model_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config = model_inference_config(model_path);
+    if !onnx_inference_enabled(config) || config.feature_order.get().is_some() {
+        return Ok(());
+    }
+    // If the session cannot be loaded, load_onnx_session has already warned and
+    // scoring falls back to the baseline caller.
+    if let Some(session) = load_onnx_session(&config.model_path) {
+        let order = resolve_feature_order(&session, config)?;
+        let _ = config.feature_order.set(order);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "onnx-inference")]
@@ -1491,17 +1211,10 @@ fn run_onnx_inference(
     Err("Could not find a numeric probability output tensor in ONNX outputs".into())
 }
 
-#[cfg(not(feature = "onnx-inference"))]
-/// ONNX inference hook fallback when the feature is disabled.
-fn run_onnx_inference(_model_path: &str, _features: &[f32]) -> Result<f64, Box<dyn std::error::Error>> {
-    Err("Built without ONNX inference support; enable feature 'onnx-inference'".into())
-}
-
+/// Score a variant with the ML model. Returns 1.0 (keep the call) whenever no
+/// model is available or inference fails.
 #[cfg(feature = "onnx-inference")]
-fn model_probability_score(
-    config: &ModelInferenceConfig,
-    features: &[f32],
-) -> f64 {
+fn model_probability_score(config: &ModelInferenceConfig, variant: &Variant) -> f64 {
     if !onnx_inference_enabled(config) {
         // No model file yet: keep baseline caller behavior (no ML filtering).
         return 1.0;
@@ -1510,104 +1223,53 @@ fn model_probability_score(
     THREAD_LOCAL_ONNX_MODELS.with(|models| {
         let mut models = models.borrow_mut();
         if !models.contains_key(config.model_path.as_str()) {
-            let model = load_onnx_session(&config.model_path);
-            // Read feature order from this session before storing it, so we
+            let mut model = load_onnx_session(&config.model_path);
+            // Read the feature order from this session before storing it, so we
             // never open a second ORT session (which can deadlock on ORT's
             // internal environment mutex).
-            if let Some(ref session) = model {
-                let mut loaded_from_metadata = false;
-
-                if let Some(feature_order) = read_feature_order_from_session(session) {
-                    if let Err(err) = validate_model_feature_order(&feature_order) {
-                        warn!(
-                            "Invalid ONNX feature metadata (feature_order/feature_names) in {} ({}). Falling back to feature_order.txt.",
-                            config.model_path,
-                            err
-                        );
-                    } else {
-                        info!(
-                            "Loaded ONNX feature_order metadata with {} features.",
-                            feature_order.len()
-                        );
-                        config.set_feature_order_from_session(feature_order);
-                        loaded_from_metadata = true;
-                    }
-                } else {
-                    warn!(
-                        "Could not read ONNX feature metadata (feature_order/feature_names) from {}. Falling back to feature_order.txt.",
-                        config.model_path
-                    );
+            let order_result = match (&model, config.feature_order.get()) {
+                (Some(session), None) => Some(resolve_feature_order(session, config)),
+                _ => None,
+            };
+            match order_result {
+                Some(Ok(order)) => {
+                    // Another thread may have won the race; the order is identical.
+                    let _ = config.feature_order.set(order);
                 }
-
-                if !loaded_from_metadata {
-                    let mut found_feature_order_txt = false;
-                    if let Some(feature_order) = read_feature_order_from_sidecar(
-                        &config.model_path,
-                        config.feature_order_path.as_deref(),
-                    ) {
-                        found_feature_order_txt = true;
-                        if let Err(err) = validate_model_feature_order(&feature_order) {
-                            warn!(
-                                "Invalid feature_order.txt fallback for {} ({}). Falling back to built-in feature order.",
-                                config.model_path,
-                                err
-                            );
-                        } else {
-                            config.set_feature_order_from_session(feature_order);
-                        }
-                    } else if let Some(expected_width) = expected_input_width(session) {
-                        let fallback_order = config.model_feature_order_snapshot();
-                        let fallback_width = fallback_order.len();
-                        if expected_width != fallback_width {
-                            let derived = derive_width_matched_feature_order(&fallback_order, expected_width);
-                            warn!(
-                                "ONNX model at {} does not carry feature_order metadata/feature_order.txt and width differs (model={}, fallback={}). Using deterministic width-matched fallback order to continue. For exact parity, re-export model with metadata key 'feature_order' or provide feature_order.txt with {} feature names.",
-                                config.model_path,
-                                expected_width,
-                                fallback_width,
-                                expected_width
-                            );
-                            config.set_feature_order_from_session(derived);
-                        }
-                    }
-
-                    if !found_feature_order_txt {
-                        warn!(
-                            "Could not load feature_order.txt for {}. Falling back to built-in {}-feature order.",
-                            config.model_path,
-                            config.model_feature_order_snapshot().len()
-                        );
-                    }
+                Some(Err(err)) => {
+                    warn!("{}. Falling back to baseline scoring.", err);
+                    model = None;
                 }
+                None => {}
             }
             models.insert(config.model_path.clone(), model);
         }
 
-        match models
+        let Some(model) = models
             .get_mut(config.model_path.as_str())
             .and_then(|m| m.as_mut())
-        {
-            Some(model) => run_onnx_inference(model, features).unwrap_or(1.0),
-            None => 1.0,
-        }
+        else {
+            return 1.0;
+        };
+        let Some(feature_order) = config.feature_order.get() else {
+            return 1.0;
+        };
+
+        let features = build_model_feature_vector(variant, feature_order);
+        run_onnx_inference(model, &features).unwrap_or(1.0)
     })
 }
 
+/// Without the `onnx-inference` feature no model scoring happens: keep baseline
+/// caller behavior (no ML filtering).
 #[cfg(not(feature = "onnx-inference"))]
-fn model_probability_score(config: &ModelInferenceConfig, features: &[f32]) -> f64 {
-    if config.model_exists {
-        match run_onnx_inference(&config.model_path, features) {
-            Ok(probability) => probability,
-            Err(_) => {
-                // If runtime inference fails, do not drop calls silently.
-                1.0
-            }
-        }
-    } else {
-        // No model file yet: keep baseline caller behavior (no ML filtering).
-        1.0
-    }
+fn model_probability_score(_config: &ModelInferenceConfig, _variant: &Variant) -> f64 {
+    1.0
 }
+
+// ---------------------------------------------------------------------------
+// Pileup processing
+// ---------------------------------------------------------------------------
 
 /// Retrieve an NM tag from a record
 ///
@@ -1652,8 +1314,17 @@ struct PileupCounts {
     rev: HashMap<BaseCall, usize>,
     total: HashMap<BaseCall, usize>,
 }
-/// Returns true if a slice has a repeated pattern of length n
-/// at the start or end, with at least cutoff bases.
+
+impl PileupCounts {
+    fn new() -> Self {
+        PileupCounts {
+            fwd: HashMap::with_capacity(8),
+            rev: HashMap::with_capacity(8),
+            total: HashMap::with_capacity(8),
+        }
+    }
+}
+
 /// Return `true` if `sequence` contains a repeated unit of length `n` of at
 /// least `cutoff` bases at the start or end.
 fn has_repeat(sequence: &[u8], n: usize, cutoff: usize) -> bool {
@@ -1707,6 +1378,13 @@ impl TrinucleotideContext {
     }
 }
 
+/// Bases immediately upstream and downstream of `pos` (`N` at sequence edges).
+fn flanking_bases(ref_seq: &[u8], pos: usize) -> (u8, u8) {
+    let upstream = if pos > 0 { ref_seq[pos - 1] } else { b'N' };
+    let downstream = if pos + 1 < ref_seq.len() { ref_seq[pos + 1] } else { b'N' };
+    (upstream, downstream)
+}
+
 /// Calculate Shannon entropy of a sequence
 /// Returns 0 for empty sequences, and is based on the frequency of A, C, G, T
 /// Non-ACGT characters are ignored in the calculation
@@ -1743,6 +1421,11 @@ fn shannon_entropy(sequence: &[u8]) -> f64 {
         .sum()
 }
 
+/// Shannon entropy of the reference in a window of `flank` bases on either side of `pos`.
+fn flank_entropy(ref_seq: &[u8], pos: usize, flank: usize) -> f64 {
+    shannon_entropy(&ref_seq[pos.saturating_sub(flank)..(pos + flank + 1).min(ref_seq.len())])
+}
+
 /// All per-position statistics returned by [`compute_pileup_counts`].
 struct PileupStats {
     ref_dist_from_read_end: f64,
@@ -1767,6 +1450,46 @@ struct PileupStats {
     indel_offset: u64,
 }
 
+/// Per-position averages derived from [`PileupStats`].
+struct SiteAverages {
+    ref_mapq: f64,
+    alt_mapq: f64,
+    ref_bq: f64,
+    alt_bq: f64,
+    ref_dist: f64,
+    alt_dist: f64,
+    ref_ins: f64,
+    alt_ins: f64,
+    mismatch: f64,
+    read_length: f64,
+}
+
+fn safe_div(num: f64, den: f64) -> f64 {
+    if num > 0.0 && den > 0.0 { num / den } else { 0.0 }
+}
+
+// ---------------------------------------------------------------------------
+// Pileup statistics and candidate filtering
+// ---------------------------------------------------------------------------
+
+impl PileupStats {
+    fn averages(&self) -> SiteAverages {
+        let total_reads = self.total_ref_counts + self.total_alt_counts;
+        SiteAverages {
+            ref_mapq: safe_div(self.count_ref_mapq, self.total_ref_counts),
+            alt_mapq: safe_div(self.count_alt_mapq, self.total_alt_counts),
+            ref_bq: safe_div(self.count_ref_bq, self.total_ref_counts),
+            alt_bq: safe_div(self.count_alt_bq, self.total_alt_counts),
+            ref_dist: safe_div(self.ref_dist_from_read_end, self.total_ref_counts),
+            alt_dist: safe_div(self.alt_dist_from_read_end, self.total_alt_counts),
+            ref_ins: safe_div(self.ref_insert_size_sum, self.total_ref_counts),
+            alt_ins: safe_div(self.alt_insert_size_sum, self.total_alt_counts),
+            mismatch: safe_div(self.total_mismatches, total_reads),
+            read_length: safe_div(self.total_read_length, total_reads),
+        }
+    }
+}
+
 /// Compute base call counts from a pileup
 ///
 /// # Arguments
@@ -1778,9 +1501,11 @@ struct PileupStats {
 /// * `max_mismatches` - Maximum allowed mismatches in a read
 /// * `ref_seq` - The reference sequence as a byte vector
 /// * `ref_pos` - The reference position
+/// * `indel_filter_repeat_limit` - Homopolymer length for indel read filtering
+///   (the dinucleotide cutoff is derived from it, rounded up to even)
 ///
 /// # Returns
-/// A Counts instance with extracted counts
+/// A PileupStats instance; strand-resolved counts are written into `pileup_counts`
 #[allow(clippy::too_many_arguments)]
 fn compute_pileup_counts(
     pileup: &Pileup,
@@ -1794,11 +1519,12 @@ fn compute_pileup_counts(
     stranded_read: &ReadNumber,
     pileup_counts: &mut PileupCounts,
     indel_filter_repeat_limit: usize,
-    dinuc_cutoff: usize,
 ) -> PileupStats {
     pileup_counts.fwd.clear();
     pileup_counts.rev.clear();
     pileup_counts.total.clear();
+
+    let dinuc_cutoff = indel_filter_repeat_limit.next_multiple_of(2);
 
     let mut stats = PileupStats {
         ref_dist_from_read_end: 0.0,
@@ -1951,51 +1677,87 @@ fn distribute_counts(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// BAM workflow orchestration
+// ---------------------------------------------------------------------------
+
+fn make_progress_bar(len: usize, label: &str) -> Result<ProgressBar, Box<dyn std::error::Error>> {
+    let pb = ProgressBar::new(len as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(&format!(
+                "{{spinner:.green}} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} {}",
+                label
+            ))?
+            .progress_chars("#>-"),
+    );
+    Ok(pb)
+}
+
+/// Call variants in every chunk in parallel on `pool`, returning all calls.
+/// A chunk that fails to process contributes no calls.
+fn call_all_chunks(
+    pool: &rayon::ThreadPool,
+    chunks: &[GenomeChunk],
+    bam_path: &str,
+    ref_seqs: &HashMap<String, Vec<u8>>,
+    args: &Args,
+    ml_threshold: f64,
+    pb: &ProgressBar,
+) -> Vec<Variant> {
+    pool.install(|| {
+        chunks
+            .par_iter()
+            .map(|chunk| {
+                let variants = call_variants(
+                    chunk,
+                    bam_path,
+                    ref_seqs
+                        .get(&chunk.contig)
+                        .expect("Contig not found in reference"),
+                    args.min_bq,
+                    args.min_mapq,
+                    args.min_depth,
+                    args.end_of_read_cutoff,
+                    args.indel_end_of_read_cutoff,
+                    args.max_mismatches,
+                    args.min_ao,
+                    args.error_rate,
+                    &args.stranded_read,
+                    args.indel_filter_repeat_limit,
+                    &args.model_path,
+                    ml_threshold,
+                )
+                .unwrap_or_else(|_e| Vec::new());
+                pb.inc(1);
+                variants
+            })
+            .flatten()
+            .collect()
+    })
+}
+
 /// Main workflow for variant calling
 ///
-/// # Arguments
-/// * `bam_path` - Path to the BAM file
-/// * `ref_path` - Path to the reference FASTA file
-/// * `vcf_path` - Path to the output VCF file
-/// * `min_bq` - Minimum base quality
-/// * `min_mapq` - Minimum mapping quality
-/// * `min_depth` - Minimum read depth
-/// * `end_of_read_cutoff` - End of read cutoff for SNPs
-/// * `indel_end_of_read_cutoff` - End of read cutoff for indels
-/// * `max_mismatches` - Maximum allowed mismatches in a read
-/// * `min_ao` - Minimum alternate allele observations
-/// * `num_threads` - Number of threads to use
-/// * `chunk_size` - Size of each genome chunk
-/// * `error_rate` - Expected general error rate
+/// Calls variants in the tumor BAM, optionally removes any call also made in
+/// the matched normal BAM, and writes the sorted result as a VCF.
 ///
 /// # Returns
 /// Ok(()) if workflow completes successfully, error otherwise
-pub fn workflow(
-    tumor_bam_path: &str,
-    ref_path: &str,
-    vcf_path: &str,
-    min_bq: usize,
-    min_mapq: usize,
-    min_depth: u32,
-    end_of_read_cutoff: usize,
-    indel_end_of_read_cutoff: usize,
-    max_mismatches: u32,
-    min_ao: u32,
-    num_threads: usize,
-    chunk_size: u64,
-    error_rate: f64,
-    stranded_read: &ReadNumber,
-    indel_filter_repeat_limit: usize,
-    model_path: &str,
-    tumor_ml_threshold: f64,
-    matched_normal_bam_path: Option<&str>,
-    normal_ml_threshold: f64,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn workflow(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TVC workflow");
+    let ref_path = args.input_ref.as_str();
+    let tumor_bam_path = args.input_bam.as_str();
+    let matched_normal_bam_path = args.matched_normal_bam.as_deref();
+
     validate_fai_and_bam(ref_path, tumor_bam_path)?;
     if let Some(normal_bam_path) = matched_normal_bam_path {
         validate_fai_and_bam(ref_path, normal_bam_path)?;
     }
+
+    #[cfg(feature = "onnx-inference")]
+    require_model_feature_order(&args.model_path)?;
 
     info!("Reading reference sequences");
     let ref_reader = faidx::Reader::from_path(ref_path)?;
@@ -2015,152 +1777,72 @@ pub fn workflow(
 
     info!("Dividing genome into chunks and getting ready for parallel processing");
 
-    let chunks: Vec<GenomeChunk> = get_genome_chunks(ref_path, chunk_size);
-
-    let pb = ProgressBar::new(chunks.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} chunks processed",
-            )?
-            .progress_chars("#>-"),
-    );
-
-    let max_open_files = 1000;
-    let open_files_counter = Arc::new(AtomicUsize::new(0));
+    let chunks: Vec<GenomeChunk> = get_genome_chunks(ref_path, args.chunk_size);
 
     // Rayon thread pool
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
+        .num_threads(args.num_threads)
         .build()?;
 
-    let all_tumor_variants: Vec<Variant> = pool.install(|| {
-        chunks
-            .par_iter()
-            .map(|chunk| {
-                while open_files_counter.load(Ordering::SeqCst) >= max_open_files {
-                    thread::sleep(Duration::from_millis(1));
-                }
-
-                open_files_counter.fetch_add(1, Ordering::SeqCst);
-
-                let res = call_variants(
-                    chunk,
-                    tumor_bam_path,
-                    seq_name_to_seq
-                        .get(&chunk.contig)
-                        .expect("Contig not found in reference"),
-                    min_bq,
-                    min_mapq,
-                    min_depth,
-                    end_of_read_cutoff,
-                    indel_end_of_read_cutoff,
-                    max_mismatches,
-                    min_ao,
-                    error_rate,
-                    stranded_read,
-                    indel_filter_repeat_limit,
-                    model_path,
-                    tumor_ml_threshold,
-                )
-                .unwrap_or_else(|_e| Vec::new());
-                open_files_counter.fetch_sub(1, Ordering::SeqCst);
-                pb.inc(1);
-                res
-            })
-            .flatten()
-            .collect()
-    });
-
+    let pb = make_progress_bar(chunks.len(), "chunks processed")?;
+    let mut all_variants = call_all_chunks(
+        &pool,
+        &chunks,
+        tumor_bam_path,
+        &seq_name_to_seq,
+        args,
+        args.tumor_ml_threshold,
+        &pb,
+    );
     pb.finish_with_message("Tumor variant calling complete. Wrapping up.");
 
-    let mut normal_variant_keys: HashSet<(String, u32, String, String)> = HashSet::new();
     if let Some(normal_bam_path) = matched_normal_bam_path {
         info!(
             "Matched normal BAM provided. Calling normal variants with ML threshold {} and using them to filter tumor calls.",
-            normal_ml_threshold
+            args.normal_ml_threshold
         );
 
-        let pb_normal = ProgressBar::new(chunks.len() as u64);
-        pb_normal.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} normal chunks processed",
-                )?
-                .progress_chars("#>-"),
+        let pb_normal = make_progress_bar(chunks.len(), "normal chunks processed")?;
+        let normal_variants = call_all_chunks(
+            &pool,
+            &chunks,
+            normal_bam_path,
+            &seq_name_to_seq,
+            args,
+            args.normal_ml_threshold,
+            &pb_normal,
         );
-
-        let all_normal_variants: Vec<Variant> = pool.install(|| {
-            chunks
-                .par_iter()
-                .map(|chunk| {
-                    while open_files_counter.load(Ordering::SeqCst) >= max_open_files {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-
-                    open_files_counter.fetch_add(1, Ordering::SeqCst);
-
-                    let res = call_variants(
-                        chunk,
-                        normal_bam_path,
-                        seq_name_to_seq
-                            .get(&chunk.contig)
-                            .expect("Contig not found in reference"),
-                        min_bq,
-                        min_mapq,
-                        min_depth,
-                        end_of_read_cutoff,
-                        indel_end_of_read_cutoff,
-                        max_mismatches,
-                        min_ao,
-                        error_rate,
-                        stranded_read,
-                        indel_filter_repeat_limit,
-                        model_path,
-                        normal_ml_threshold,
-                    )
-                    .unwrap_or_else(|_e| Vec::new());
-                    open_files_counter.fetch_sub(1, Ordering::SeqCst);
-                    pb_normal.inc(1);
-                    res
-                })
-                .flatten()
-                .collect()
-        });
-
         pb_normal.finish_with_message("Normal variant calling complete.");
 
-        normal_variant_keys = all_normal_variants
+        let normal_variant_keys: HashSet<(String, u32, String, String)> = normal_variants
             .into_iter()
             .map(|v| (v.contig, v.pos, v.reference, v.alt))
             .collect();
-    }
 
-    let mut all_variants: Vec<Variant> = all_tumor_variants;
-    if !normal_variant_keys.is_empty() {
         all_variants.retain(|v| {
             !normal_variant_keys.contains(&(v.contig.clone(), v.pos, v.reference.clone(), v.alt.clone()))
         });
     }
 
     // Sort all variants by contig and position
-    let mut sorted_variants = all_variants;
-    sorted_variants.sort_by(|a, b| match a.contig.cmp(&b.contig) {
-        std::cmp::Ordering::Equal => a.pos.cmp(&b.pos),
-        other => other,
-    });
+    all_variants.sort_by(|a, b| a.contig.cmp(&b.contig).then(a.pos.cmp(&b.pos)));
 
     // Write to VCF
-    let mut vcf_file = File::create(vcf_path)?;
+    let mut vcf_file = File::create(&args.output_vcf)?;
     let header = bam::Reader::from_path(tumor_bam_path)?.header().to_owned();
     vcf_file.write_all(get_vcf_header(&header).as_bytes())?;
 
-    for variant in sorted_variants {
+    for variant in all_variants {
         vcf_file.write_all(variant.to_vcf().as_bytes())?;
     }
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// BAM traversal and per-site statistics
+// ---------------------------------------------------------------------------
+
 /// Compute trinucleotide context-specific error rates for a genome chunk
 ///
 /// # Arguments
@@ -2208,18 +1890,13 @@ fn compute_tnc_error_rates(
     let tid = header.tid(chunk.contig.as_bytes()).ok_or("Contig not found in BAM header")?;
     bam.fetch((tid, chunk.start as i64, chunk.end as i64))?;
 
-    let mut pileup_counts = PileupCounts {
-        fwd: HashMap::with_capacity(8),
-        rev: HashMap::with_capacity(8),
-        total: HashMap::with_capacity(8),
-    };
+    let mut pileup_counts = PileupCounts::new();
 
     let mut fwd_snps = HashMap::with_capacity(4);
     let mut rev_snps = HashMap::with_capacity(4);
-    let mut fwd_indels = HashMap::with_capacity(4);
-    let mut rev_indels = HashMap::with_capacity(4);
     let mut total_snps = HashMap::with_capacity(4);
-    let mut total_indels = HashMap::with_capacity(4);
+    // distribute_counts always fills an indel map; the error-rate estimate ignores it.
+    let mut indel_scratch = HashMap::with_capacity(4);
 
     for result in bam.pileup() {
         let pileup: Pileup = result?;
@@ -2230,39 +1907,33 @@ fn compute_tnc_error_rates(
         }
 
         let ref_base = ref_seq[pos as usize];
-        let dinuc_cutoff = if !indel_filter_repeat_limit.is_multiple_of(2) {
-            indel_filter_repeat_limit + 1
-        } else {
-            indel_filter_repeat_limit
-        };
 
         compute_pileup_counts(
             &pileup, min_bq, min_mapq, end_of_read_cutoff, indel_end_of_read_cutoff,
             max_mismatches, ref_seq, pos, stranded_read, &mut pileup_counts,
-            indel_filter_repeat_limit, dinuc_cutoff,
+            indel_filter_repeat_limit,
         );
 
-        fwd_snps.clear(); rev_snps.clear(); fwd_indels.clear();
-        rev_indels.clear(); total_snps.clear(); total_indels.clear();
+        fwd_snps.clear();
+        rev_snps.clear();
+        total_snps.clear();
+        indel_scratch.clear();
 
-        distribute_counts(&pileup_counts.fwd,   &mut fwd_snps,   &mut fwd_indels);
-        distribute_counts(&pileup_counts.rev,   &mut rev_snps,   &mut rev_indels);
-        distribute_counts(&pileup_counts.total, &mut total_snps, &mut total_indels);
+        distribute_counts(&pileup_counts.fwd,   &mut fwd_snps,   &mut indel_scratch);
+        distribute_counts(&pileup_counts.rev,   &mut rev_snps,   &mut indel_scratch);
+        distribute_counts(&pileup_counts.total, &mut total_snps, &mut indel_scratch);
 
-        let upstream   = if pos > 0                              { ref_seq[pos as usize - 1] } else { b'N' };
-        let downstream = if pos < ref_seq.len() as u32 - 1      { ref_seq[pos as usize + 1] } else { b'N' };
+        let (upstream, downstream) = flanking_bases(ref_seq, pos as usize);
 
-        let (fwd_cands, fwd_probs) = get_count_vec_candidates(&fwd_snps, error_rate);
-        let (rev_cands, rev_probs) = get_count_vec_candidates(&rev_snps, error_rate);
-        let (_total_cands, total_probs) = get_count_vec_candidates(&total_snps, error_rate);
-
-        let (counts_snps, ..) = {
-            let (cands, counts, probs) = select_candidates_and_counts(
-                ref_base as char, upstream as char, downstream as char,
-                &fwd_cands, &fwd_snps, &rev_cands, &rev_snps, &total_snps,
-                &fwd_probs, &rev_probs, &total_probs,
-            );
-            (counts, cands, probs)
+        // Same strand selection as calling: the directive decides which strand's counts are used.
+        let (fwd_cands, _) = get_count_vec_candidates(&fwd_snps, error_rate);
+        let directive = find_where_to_call_variants(
+            ref_base as char, &fwd_cands, upstream as char, downstream as char,
+        );
+        let counts_snps = match directive {
+            CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => &rev_snps,
+            CallingDirective::ReferenceSiteOt | CallingDirective::DenovoSiteOt => &fwd_snps,
+            CallingDirective::BothStrands | CallingDirective::Indel => &total_snps,
         };
 
         let total_ref_snps: u64 = counts_snps
@@ -2298,7 +1969,184 @@ fn compute_tnc_error_rates(
 
     Ok(tnc_error_rates)
 }
-/// Call variants in a given genome chunk
+
+// ---------------------------------------------------------------------------
+// Variant-calling pipeline
+// ---------------------------------------------------------------------------
+
+/// Values shared by SNP and indel calling at a single position.
+struct SiteContext<'a> {
+    contig: &'a str,
+    /// 0-based position.
+    pos: u32,
+    tnc: TrinucleotideContext,
+    tnc_er: f64,
+    stats: &'a PileupStats,
+    avg: SiteAverages,
+    large_entropy: f64,
+    small_entropy: f64,
+}
+
+/// Candidates and summary statistics for one allele class (SNPs or indels) at a position.
+struct ClassCalls {
+    candidates: HashSet<BaseCall>,
+    counts: HashMap<BaseCall, usize>,
+    /// Sum of `counts`.
+    depth: u64,
+    probability: f64,
+    fwd_probability: f64,
+    rev_probability: f64,
+    fwd_count: f64,
+    rev_count: f64,
+    total_count: f64,
+    directive: CallingDirective,
+}
+
+/// Emission rules that differ between the SNP and indel classes.
+struct ClassRules {
+    /// Depth reported in the VCF and used for genotyping.
+    reported_depth: u64,
+    read_end_filtered_count: f64,
+    genotype_error_rate: f64,
+    /// Minimum alternate observations required to emit a candidate.
+    min_alt_obs: usize,
+    /// Use this instead of the directive derived from the pileup.
+    directive_override: Option<CallingDirective>,
+}
+
+/// Choose candidates, counts and strand-bias statistics for one allele class
+/// according to the calling directive.
+fn select_class_calls(
+    site: &SiteContext,
+    fwd: &HashMap<BaseCall, usize>,
+    rev: &HashMap<BaseCall, usize>,
+    total: &HashMap<BaseCall, usize>,
+) -> ClassCalls {
+    let (fwd_cands, fwd_probs) = get_count_vec_candidates(fwd, site.tnc_er);
+    let (rev_cands, rev_probs) = get_count_vec_candidates(rev, site.tnc_er);
+    let (_, total_probs) = get_count_vec_candidates(total, site.tnc_er);
+
+    let directive = find_where_to_call_variants(
+        site.tnc.ref_base as char,
+        &fwd_cands,
+        site.tnc.upstream_base as char,
+        site.tnc.downstream_base as char,
+    );
+
+    let fwd_prob_sum = fwd_probs.iter().sum::<f64>();
+    let rev_prob_sum = rev_probs.iter().sum::<f64>();
+    let combined = (fwd_prob_sum + rev_prob_sum).max(1e-10);
+
+    let (candidates, counts, probs) = match &directive {
+        CallingDirective::ReferenceSiteOb | CallingDirective::DenovoSiteOb => {
+            (rev_cands, rev.clone(), rev_probs)
+        }
+        CallingDirective::ReferenceSiteOt | CallingDirective::DenovoSiteOt => {
+            (fwd_cands, fwd.clone(), fwd_probs)
+        }
+        CallingDirective::BothStrands | CallingDirective::Indel => {
+            let intersection: HashSet<BaseCall> =
+                fwd_cands.intersection(&rev_cands).cloned().collect();
+            (intersection, total.clone(), total_probs)
+        }
+    };
+
+    ClassCalls {
+        depth: counts.values().sum::<usize>() as u64,
+        candidates,
+        counts,
+        probability: probs.iter().sum::<f64>(),
+        fwd_probability: fwd_prob_sum / combined,
+        rev_probability: rev_prob_sum / combined,
+        fwd_count: fwd.values().sum::<usize>() as f64,
+        rev_count: rev.values().sum::<usize>() as f64,
+        total_count: total.values().sum::<usize>() as f64,
+        directive,
+    }
+}
+
+/// Build, score and (if it passes the ML threshold) emit a variant for each candidate in `class`.
+fn emit_variants(
+    out: &mut Vec<Variant>,
+    site: &SiteContext,
+    class: ClassCalls,
+    rules: &ClassRules,
+    min_depth: u32,
+    ml_threshold: f64,
+    model_config: &ModelInferenceConfig,
+) {
+    if class.candidates.is_empty() || class.depth < min_depth as u64 {
+        return;
+    }
+
+    let directive = rules
+        .directive_override
+        .clone()
+        .unwrap_or_else(|| class.directive.clone());
+
+    for candidate in &class.candidates {
+        let alt_counts = *class.counts.get(candidate).unwrap_or(&0);
+        if alt_counts < rules.min_alt_obs {
+            continue;
+        }
+
+        let mut variant = Variant {
+            contig: site.contig.to_string(),
+            pos: site.pos + 1,
+            reference: candidate.get_reference_allele(),
+            alt: candidate.get_alternate_allele(),
+            // Genotype is assigned only after the call passes the ML filter.
+            genotype: String::new(),
+            score: 0.0,
+            depth: rules.reported_depth as u32,
+            alt_counts: alt_counts as u32,
+            calling_directive: directive.clone(),
+            error_rate: site.tnc_er,
+            tnc: site.tnc.clone(),
+            probability: class.probability,
+            mapq_filtered_ref: site.stats.mapq_filtered_ref,
+            mapq_filtered_alt: site.stats.mapq_filtered_alt,
+            bq_filtered_ref: site.stats.bq_filtered_ref,
+            bq_filtered_alt: site.stats.bq_filtered_alt,
+            average_ref_mapq: site.avg.ref_mapq,
+            average_alt_mapq: site.avg.alt_mapq,
+            average_ref_bq: site.avg.ref_bq,
+            average_alt_bq: site.avg.alt_bq,
+            avg_ref_dist_from_read_end: site.avg.ref_dist,
+            avg_alt_dist_from_read_end: site.avg.alt_dist,
+            avg_ref_insert_size: site.avg.ref_ins,
+            avg_alt_insert_size: site.avg.alt_ins,
+            fwd_probability: class.fwd_probability,
+            rev_probability: class.rev_probability,
+            large_local_entropy: site.large_entropy,
+            small_local_entropy: site.small_entropy,
+            read_end_filtered_count: rules.read_end_filtered_count,
+            avg_mismatch_per_read: site.avg.mismatch,
+            mismatch_filtered_count: site.stats.mismatch_filtered_count,
+            avg_read_length: site.avg.read_length,
+            forward_strand_count_snps: class.fwd_count,
+            reverse_strand_count_snps: class.rev_count,
+            both_strands_count_snps: class.total_count,
+            model_probability: 0.0,
+        };
+
+        variant.model_probability = model_probability_score(model_config, &variant);
+        if variant.model_probability < ml_threshold {
+            continue;
+        }
+
+        let genotype = assign_genotype(
+            alt_counts,
+            rules.reported_depth as usize,
+            rules.genotype_error_rate,
+        );
+        variant.genotype = genotype.genotype;
+        variant.score = genotype.score;
+        out.push(variant);
+    }
+}
+
+/// Call all SNP and indel variants in one genome chunk.
 ///
 /// # Arguments
 /// * `chunk` - The genome chunk to process
@@ -2310,13 +2158,11 @@ fn compute_tnc_error_rates(
 /// * `end_of_read_cutoff` - End of read cutoff for SNPs
 /// * `indel_end_of_read_cutoff` - End of read cutoff for indels
 /// * `max_mismatches` - Maximum allowed mismatches in a read
-/// * `min_ao` - Minimum alternate allele observations
+/// * `min_ao` - Minimum alternate allele observations (indels)
 /// * `error_rate` - Expected general error rate
 ///
 /// # Returns
 /// A vector of Variant instances
-
-/// Call all SNP and indel variants in one genome chunk.
 fn call_variants(
     chunk: &GenomeChunk,
     bam_path: &str,
@@ -2348,11 +2194,7 @@ fn call_variants(
     bam.fetch((tid, chunk.start as i64, chunk.end as i64))?;
 
     let mut variants = Vec::new();
-    let mut pileup_counts = PileupCounts {
-        fwd: HashMap::with_capacity(8),
-        rev: HashMap::with_capacity(8),
-        total: HashMap::with_capacity(8),
-    };
+    let mut pileup_counts = PileupCounts::new();
 
     let mut fwd_snps   = HashMap::with_capacity(4);
     let mut rev_snps   = HashMap::with_capacity(4);
@@ -2363,40 +2205,15 @@ fn call_variants(
 
     for result in bam.pileup() {
         let pileup: Pileup = result?;
-        let tid = pileup.tid();
-        let ref_name = std::str::from_utf8(header.tid2name(tid))?;
+        let ref_name = std::str::from_utf8(header.tid2name(pileup.tid()))?;
         let pos = pileup.pos();
         let ref_base = ref_seq[pos as usize];
-
-        // if pileup.depth() < min_depth {
-        //     continue;
-        // }
-
-        let dinuc_cutoff = if !indel_filter_repeat_limit.is_multiple_of(2) {
-            indel_filter_repeat_limit + 1
-        } else {
-            indel_filter_repeat_limit
-        };
 
         let s = compute_pileup_counts(
             &pileup, min_bq, min_mapq, end_of_read_cutoff, indel_end_of_read_cutoff,
             max_mismatches, ref_seq, pos, stranded_read, &mut pileup_counts,
-            indel_filter_repeat_limit, dinuc_cutoff,
+            indel_filter_repeat_limit,
         );
-
-        // Derived averages.
-        let div = |num: f64, den: f64| if num > 0.0 && den > 0.0 { num / den } else { 0.0 };
-        let average_ref_mapq = div(s.count_ref_mapq, s.total_ref_counts);
-        let average_alt_mapq = div(s.count_alt_mapq, s.total_alt_counts);
-        let average_ref_bq   = div(s.count_ref_bq, s.total_ref_counts);
-        let average_alt_bq   = div(s.count_alt_bq, s.total_alt_counts);
-        let avg_ref_dist     = div(s.ref_dist_from_read_end, s.total_ref_counts);
-        let avg_alt_dist     = div(s.alt_dist_from_read_end, s.total_alt_counts);
-        let avg_ref_ins      = div(s.ref_insert_size_sum, s.total_ref_counts);
-        let avg_alt_ins      = div(s.alt_insert_size_sum, s.total_alt_counts);
-        let total_reads      = s.total_ref_counts + s.total_alt_counts;
-        let avg_mismatch     = div(s.total_mismatches, total_reads);
-        let avg_read_length  = div(s.total_read_length, total_reads);
 
         fwd_snps.clear(); rev_snps.clear(); fwd_indels.clear();
         rev_indels.clear(); total_snps.clear(); total_indels.clear();
@@ -2405,274 +2222,62 @@ fn call_variants(
         distribute_counts(&pileup_counts.rev,   &mut rev_snps,   &mut rev_indels);
         distribute_counts(&pileup_counts.total, &mut total_snps, &mut total_indels);
 
-        let upstream   = if pos > 0                         { ref_seq[pos as usize - 1] } else { b'N' };
-        let downstream = if pos < ref_seq.len() as u32 - 1 { ref_seq[pos as usize + 1] } else { b'N' };
+        let (upstream, downstream) = flanking_bases(ref_seq, pos as usize);
+        let tnc = TrinucleotideContext::new(upstream, ref_base, downstream);
+        let tnc_er = error_map.get(&tnc).copied().unwrap_or(error_rate);
 
-        // Entropy.
-        let large_flank = 50usize;
-        let large_entropy = shannon_entropy(
-            &ref_seq[(pos as usize).saturating_sub(large_flank)
-                ..((pos as usize + large_flank + 1).min(ref_seq.len()))],
-        );
-        let small_flank = 15usize;
-        let small_entropy = shannon_entropy(
-            &ref_seq[(pos as usize).saturating_sub(small_flank)
-                ..((pos as usize + small_flank + 1).min(ref_seq.len()))],
-        );
+        let site = SiteContext {
+            contig: ref_name,
+            pos,
+            tnc,
+            tnc_er,
+            stats: &s,
+            avg: s.averages(),
+            large_entropy: flank_entropy(ref_seq, pos as usize, 50),
+            small_entropy: flank_entropy(ref_seq, pos as usize, 15),
+        };
 
-        let ctx = TrinucleotideContext::new(upstream, ref_base, downstream);
-        let tnc_er = error_map.get(&ctx).copied().unwrap_or(error_rate);
+        let snps = select_class_calls(&site, &fwd_snps, &rev_snps, &total_snps);
+        let indels = select_class_calls(&site, &fwd_indels, &rev_indels, &total_indels);
 
-        let (fwd_cands, fwd_probs) = get_count_vec_candidates(&fwd_snps, tnc_er);
-        let (rev_cands, rev_probs) = get_count_vec_candidates(&rev_snps, tnc_er);
-        let (_total_cands_snps, total_probs_snps) = get_count_vec_candidates(&total_snps, tnc_er);
-
-        let (fwd_indel_cands, fwd_indel_probs) = get_count_vec_candidates(&fwd_indels, tnc_er);
-        let (rev_indel_cands, rev_indel_probs) = get_count_vec_candidates(&rev_indels, tnc_er);
-        let (_total_cands_indels, total_probs_indels) = get_count_vec_candidates(&total_indels, tnc_er);
-
-        let directive_snps = find_where_to_call_variants(
-            ref_base as char, &fwd_cands, upstream as char, downstream as char,
-        );
-
-        let (candidate_snps, counts_snps, probs_snps) = select_candidates_and_counts(
-            ref_base as char, upstream as char, downstream as char,
-            &fwd_cands, &fwd_snps, &rev_cands, &rev_snps, &total_snps,
-            &fwd_probs, &rev_probs, &total_probs_snps,
-        );
-
-        let (candidate_indels, counts_indels, probs_indels) = select_candidates_and_counts(
-            ref_base as char, upstream as char, downstream as char,
-            &fwd_indel_cands, &fwd_indels, &rev_indel_cands, &rev_indels, &total_indels,
-            &fwd_indel_probs, &rev_indel_probs, &total_probs_indels,
-        );
-
-        let total_depth_snps   = counts_snps.values().sum::<usize>() as u64;
-        let total_depth_indels = counts_indels.values().sum::<usize>() as u64;
-        let total_depth        = total_depth_snps + total_depth_indels;
+        let total_depth = snps.depth + indels.depth;
         let total_depth_filtered = total_depth.saturating_sub(s.indel_offset);
 
-        let prob_snps   = probs_snps.iter().sum::<f64>();
-        let prob_indels = probs_indels.iter().sum::<f64>();
+        let snp_rules = ClassRules {
+            reported_depth: total_depth,
+            read_end_filtered_count: s.read_end_filtered_count_snps,
+            genotype_error_rate: tnc_er,
+            min_alt_obs: 0,
+            directive_override: None,
+        };
+        let indel_rules = ClassRules {
+            reported_depth: total_depth_filtered,
+            read_end_filtered_count: s.read_end_filtered_count_indels,
+            genotype_error_rate: 0.05,
+            min_alt_obs: min_ao as usize,
+            directive_override: Some(CallingDirective::BothStrands),
+        };
 
-        let fwd_prob_sum = fwd_probs.iter().sum::<f64>();
-        let rev_prob_sum = rev_probs.iter().sum::<f64>();
-        let combined = (fwd_prob_sum + rev_prob_sum).max(1e-10);
-        let fwd_bias = fwd_prob_sum / combined;
-        let rev_bias = rev_prob_sum / combined;
-
-        let fwd_count_snps  = fwd_snps.values().sum::<usize>() as f64;
-        let rev_count_snps  = rev_snps.values().sum::<usize>() as f64;
-        let both_count_snps = total_snps.values().sum::<usize>() as f64;
-
-        let fwd_indel_prob_sum = fwd_indel_probs.iter().sum::<f64>();
-        let rev_indel_prob_sum = rev_indel_probs.iter().sum::<f64>();
-        let combined_indels = (fwd_indel_prob_sum + rev_indel_prob_sum).max(1e-10);
-        let fwd_bias_indels = fwd_indel_prob_sum / combined_indels;
-        let rev_bias_indels = rev_indel_prob_sum / combined_indels;
-
-        let fwd_count_indels  = fwd_indels.values().sum::<usize>() as f64;
-        let rev_count_indels  = rev_indels.values().sum::<usize>() as f64;
-        let both_count_indels = total_indels.values().sum::<usize>() as f64;
-
-        // --- Emit SNP variants ---
-        if !candidate_snps.is_empty() && total_depth_snps >= min_depth as u64 {
-            for candidate in candidate_snps {
-                let alt_counts = *counts_snps.get(&candidate).unwrap_or(&0);
-                let ref_allele = candidate.get_reference_allele();
-                let alt_allele = candidate.get_alternate_allele();
-                let vt = infer_variant_type_from_alleles(&ref_allele, &alt_allele);
-                let model_inputs = ModelFeatureInputs {
-                    depth: total_depth as f64,
-                    alt_counts: alt_counts as f64,
-                    error_rate: tnc_er,
-                    caller_probability: prob_snps,
-                    mapq_filtered_ref: s.mapq_filtered_ref,
-                    mapq_filtered_alt: s.mapq_filtered_alt,
-                    bq_filtered_ref: s.bq_filtered_ref,
-                    bq_filtered_alt: s.bq_filtered_alt,
-                    average_ref_mapq,
-                    average_alt_mapq,
-                    average_ref_bq,
-                    average_alt_bq,
-                    avg_ref_dist,
-                    avg_alt_dist,
-                    avg_ref_ins,
-                    avg_alt_ins,
-                    fwd_probability: fwd_bias,
-                    rev_probability: rev_bias,
-                    large_entropy,
-                    small_entropy,
-                    read_end_filtered_count: s.read_end_filtered_count_snps,
-                    avg_mismatch_per_read: avg_mismatch,
-                    mismatch_filtered_count: s.mismatch_filtered_count,
-                    avg_read_length,
-                    fwd_count: fwd_count_snps,
-                    rev_count: rev_count_snps,
-                    total_count: both_count_snps,
-                    tnc_up: upstream as char,
-                    tnc_ref: ref_base as char,
-                    tnc_down: downstream as char,
-                    vt,
-                };
-                let feature_order = model_config.model_feature_order_snapshot();
-                let model_features = build_model_feature_vector(&model_inputs, &feature_order);
-                #[cfg(feature = "onnx-inference")]
-                let model_probability = model_probability_score(model_config, &model_features);
-                #[cfg(not(feature = "onnx-inference"))]
-                let model_probability = model_probability_score(model_config, &model_features);
-                if model_probability < ml_threshold {
-                    continue;
-                }
-                let genotype = assign_genotype(alt_counts, total_depth as usize, tnc_er);
-
-                variants.push(Variant::new(
-                    ref_name.to_string(), pos + 1,
-                    ref_allele, alt_allele,
-                    genotype.genotype, genotype.score,
-                    total_depth as u32, alt_counts as u32,
-                    directive_snps.clone(), tnc_er, ctx.clone(),
-                    prob_snps, s.mapq_filtered_ref, s.mapq_filtered_alt,
-                    s.bq_filtered_ref, s.bq_filtered_alt,
-                    average_ref_mapq, average_alt_mapq, average_ref_bq, average_alt_bq,
-                    avg_ref_dist, avg_alt_dist, avg_ref_ins, avg_alt_ins,
-                    fwd_bias, rev_bias, large_entropy, small_entropy,
-                    s.read_end_filtered_count_snps, avg_mismatch, s.mismatch_filtered_count,
-                    avg_read_length, fwd_count_snps, rev_count_snps, both_count_snps,
-                    model_probability,
-                ));
-            }
-        }
-
-        // --- Emit indel variants ---
-        if !candidate_indels.is_empty() && total_depth_indels >= min_depth as u64 {
-            for candidate in candidate_indels {
-                let alt_counts = *counts_indels.get(&candidate).unwrap_or(&0);
-                if alt_counts < min_ao as usize {
-                    continue;
-                }
-                let ref_allele = candidate.get_reference_allele();
-                let alt_allele = candidate.get_alternate_allele();
-                let vt = infer_variant_type_from_alleles(&ref_allele, &alt_allele);
-                let model_inputs = ModelFeatureInputs {
-                    depth: total_depth_filtered as f64,
-                    alt_counts: alt_counts as f64,
-                    error_rate: tnc_er,
-                    caller_probability: prob_indels,
-                    mapq_filtered_ref: s.mapq_filtered_ref,
-                    mapq_filtered_alt: s.mapq_filtered_alt,
-                    bq_filtered_ref: s.bq_filtered_ref,
-                    bq_filtered_alt: s.bq_filtered_alt,
-                    average_ref_mapq,
-                    average_alt_mapq,
-                    average_ref_bq,
-                    average_alt_bq,
-                    avg_ref_dist,
-                    avg_alt_dist,
-                    avg_ref_ins,
-                    avg_alt_ins,
-                    fwd_probability: fwd_bias_indels,
-                    rev_probability: rev_bias_indels,
-                    large_entropy,
-                    small_entropy,
-                    read_end_filtered_count: s.read_end_filtered_count_indels,
-                    avg_mismatch_per_read: avg_mismatch,
-                    mismatch_filtered_count: s.mismatch_filtered_count,
-                    avg_read_length,
-                    fwd_count: fwd_count_indels,
-                    rev_count: rev_count_indels,
-                    total_count: both_count_indels,
-                    tnc_up: upstream as char,
-                    tnc_ref: ref_base as char,
-                    tnc_down: downstream as char,
-                    vt,
-                };
-                let feature_order = model_config.model_feature_order_snapshot();
-                let model_features = build_model_feature_vector(&model_inputs, &feature_order);
-                #[cfg(feature = "onnx-inference")]
-                let model_probability = model_probability_score(model_config, &model_features);
-                #[cfg(not(feature = "onnx-inference"))]
-                let model_probability = model_probability_score(model_config, &model_features);
-                if model_probability < ml_threshold {
-                    continue;
-                }
-                let genotype = assign_genotype(alt_counts, total_depth_filtered as usize, 0.05);
-
-                variants.push(Variant::new(
-                    ref_name.to_string(), pos + 1,
-                    ref_allele, alt_allele,
-                    genotype.genotype, genotype.score,
-                    total_depth_filtered as u32, alt_counts as u32,
-                    CallingDirective::BothStrands, tnc_er, ctx.clone(),
-                    prob_indels, s.mapq_filtered_ref, s.mapq_filtered_alt,
-                    s.bq_filtered_ref, s.bq_filtered_alt,
-                    average_ref_mapq, average_alt_mapq, average_ref_bq, average_alt_bq,
-                    avg_ref_dist, avg_alt_dist, avg_ref_ins, avg_alt_ins,
-                    fwd_bias_indels, rev_bias_indels, large_entropy, small_entropy,
-                    s.read_end_filtered_count_indels, avg_mismatch, s.mismatch_filtered_count,
-                    avg_read_length, fwd_count_indels, rev_count_indels, both_count_indels,
-                    model_probability,
-                ));
-            }
-        }
+        emit_variants(&mut variants, &site, snps, &snp_rules, min_depth, ml_threshold, model_config);
+        emit_variants(&mut variants, &site, indels, &indel_rules, min_depth, ml_threshold, model_config);
     }
 
     Ok(variants)
 }
 
+// ---------------------------------------------------------------------------
+// Application entry point
+// ---------------------------------------------------------------------------
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let _ = CLI_FEATURE_ORDER_PATH.set(args.feature_order_path.clone());
-    let tumor_bam_path = &args.input_bam;
-    let matched_normal_bam_path = args.matched_normal_bam.as_deref();
-    let vcf_path = &args.output_vcf;
-    let min_bq = args.min_bq;
-    let min_mapq = args.min_mapq;
-    let min_depth = args.min_depth;
-    let ref_path = &args.input_ref;
-    let end_of_read_cutoff = args.end_of_read_cutoff;
-    let indel_end_of_read_cutoff = args.indel_end_of_read_cutoff;
-    let max_mismatches = args.max_mismatches;
-    let min_ao = args.min_ao;
-    let num_threads = args.num_threads;
-    let chunk_size = args.chunk_size;
-    let error_rate = args.error_rate;
-    let stranded_read = &args.stranded_read;
-    let indel_filter_repeat_limit = args.indel_filter_repeat_limit;
-    let model_path = &args.model_path;
-    let tumor_ml_threshold = args.tumor_ml_threshold;
-    let normal_ml_threshold = args.normal_ml_threshold;
-
-    let level = args.log_level.as_str(); // use the enum value from clap
 
     subscriber_fmt()
-        .with_env_filter(EnvFilter::new(level))
+        .with_env_filter(EnvFilter::new(args.log_level.as_str()))
         .with_target(false)
         .init();
 
-    workflow(
-        tumor_bam_path,
-        ref_path,
-        vcf_path,
-        min_bq,
-        min_mapq,
-        min_depth,
-        end_of_read_cutoff,
-        indel_end_of_read_cutoff,
-        max_mismatches,
-        min_ao,
-        num_threads,
-        chunk_size,
-        error_rate,
-        stranded_read,
-        indel_filter_repeat_limit,
-        model_path,
-        tumor_ml_threshold,
-        matched_normal_bam_path,
-        normal_ml_threshold,
-    )?;
-
-    Ok(())
+    workflow(&args)
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,8 +2289,18 @@ mod tests {
     use super::*;
     use rust_htslib::faidx;
 
+    #[test]
+    #[cfg(feature = "onnx-inference")]
+    fn metadata_parser_requires_feature_order() {
+        assert_eq!(parse_feature_order_from_metadata("other=value"), None);
+        assert_eq!(
+            parse_feature_order_from_metadata(r#"["DP","AO"]"#),
+            Some(vec!["DP".to_string(), "AO".to_string()])
+        );
+    }
+
     macro_rules! make_variant_test {
-        ($fn_name:ident, $bam_file:expr, $pos:expr, $ref_base:expr, $alt_base:expr, $gt:expr, $stranded_read:expr) => {
+        ($fn_name:ident, $bam_file:expr, $pos:expr, $ref_base:expr, $alt_base:expr, $stranded_read:expr) => {
             #[test]
             fn $fn_name() {
                 let test_ref = "test_assets/chr11.fasta";
@@ -2727,20 +2342,20 @@ mod tests {
         };
     }
 
-    make_variant_test!(test_both_strands_chr11_8198900_a_c_homo,        "both_strands_chr11_8198900_A_C_homo.bam",        8198900,   "A", "C",      "1/1", ReadNumber::R1);
-    make_variant_test!(test_both_strands_chr11_8198951_t_a_het,         "both_strands_chr11_8198951_T_A_het.bam",         8198951,   "T", "A",      "0/1", ReadNumber::R1);
-    make_variant_test!(test_denovo_ob_chr11_134755809_t_c_homo,         "denovo_ob_chr11_134755809_T_C_homo.bam",         134755809, "T", "C",      "1/1", ReadNumber::R1);
-    make_variant_test!(test_denovo_ob_chr11_134911365_t_c_het,          "denovo_ob_chr11_134911365_T_C_het.bam",          134911365, "T", "C",      "0/1", ReadNumber::R1);
-    make_variant_test!(test_short_hetero_del,                           "chr11:1160400-1160500_short_hetero_del.bam",     1160456,   "AC", "A",     "0/1", ReadNumber::R1);
-    make_variant_test!(test_long_ins_hetero,                            "chr11:228150-228350_long_ins_hetero.bam",        228244,    "C", "CA",     "0/1", ReadNumber::R1);
-    make_variant_test!(test_short_insertion_homo,                       "chr11:6586900-6587100_short_ins_homo.bam",       6586999,   "T", "TG",     "1/1", ReadNumber::R1);
-    make_variant_test!(test_long_ins_homo,                              "chr11:5888900-5889100_long_ins_homo.bam",        5889008,   "C", "CTAGAG", "1/1", ReadNumber::R1);
-    make_variant_test!(test_denovo_ot_chr11_134749303_a_g_het,          "denovo_ot_chr11_134749303_A_G_het.bam",          134749303, "A", "G",      "0/1", ReadNumber::R1);
-    make_variant_test!(test_denovo_ot_chr11_134479860_a_g_homo,         "denovo_ot_chr11_134479860_A_G_homo.bam",         134479860, "A", "G",      "1/1", ReadNumber::R1);
-    make_variant_test!(test_ref_ob_chr11_134012307_c_a_het,             "ref_ob_chr11_134012307_C_A_het.bam",             134012307, "C", "A",      "0/1", ReadNumber::R1);
-    make_variant_test!(test_ref_ob_chr11_134610622_c_t_homo,            "ref_ob_chr11_134610622_C_T_homo.bam",            134610622, "C", "T",      "1/1", ReadNumber::R1);
-    make_variant_test!(test_ref_ot_chr11_134473154_g_a_homo,            "ref_ot_chr11_134473154_G_A_homo.bam",            134473154, "G", "A",      "1/1", ReadNumber::R1);
-    make_variant_test!(test_ref_ot_chr11_8195526_g_a_het,               "ref_ot_chr11_8195526_G_A_het.bam",               8195526,   "G", "A",      "0/1", ReadNumber::R1);
+    make_variant_test!(test_both_strands_chr11_8198900_a_c_homo,        "both_strands_chr11_8198900_A_C_homo.bam",        8198900,   "A", "C",      ReadNumber::R1);
+    make_variant_test!(test_both_strands_chr11_8198951_t_a_het,         "both_strands_chr11_8198951_T_A_het.bam",         8198951,   "T", "A",      ReadNumber::R1);
+    make_variant_test!(test_denovo_ob_chr11_134755809_t_c_homo,         "denovo_ob_chr11_134755809_T_C_homo.bam",         134755809, "T", "C",      ReadNumber::R1);
+    make_variant_test!(test_denovo_ob_chr11_134911365_t_c_het,          "denovo_ob_chr11_134911365_T_C_het.bam",          134911365, "T", "C",      ReadNumber::R1);
+    make_variant_test!(test_short_hetero_del,                           "chr11:1160400-1160500_short_hetero_del.bam",     1160456,   "AC", "A",     ReadNumber::R1);
+    make_variant_test!(test_long_ins_hetero,                            "chr11:228150-228350_long_ins_hetero.bam",        228244,    "C", "CA",     ReadNumber::R1);
+    make_variant_test!(test_short_insertion_homo,                       "chr11:6586900-6587100_short_ins_homo.bam",       6586999,   "T", "TG",     ReadNumber::R1);
+    make_variant_test!(test_long_ins_homo,                              "chr11:5888900-5889100_long_ins_homo.bam",        5889008,   "C", "CTAGAG", ReadNumber::R1);
+    make_variant_test!(test_denovo_ot_chr11_134749303_a_g_het,          "denovo_ot_chr11_134749303_A_G_het.bam",          134749303, "A", "G",      ReadNumber::R1);
+    make_variant_test!(test_denovo_ot_chr11_134479860_a_g_homo,         "denovo_ot_chr11_134479860_A_G_homo.bam",         134479860, "A", "G",      ReadNumber::R1);
+    make_variant_test!(test_ref_ob_chr11_134012307_c_a_het,             "ref_ob_chr11_134012307_C_A_het.bam",             134012307, "C", "A",      ReadNumber::R1);
+    make_variant_test!(test_ref_ob_chr11_134610622_c_t_homo,            "ref_ob_chr11_134610622_C_T_homo.bam",            134610622, "C", "T",      ReadNumber::R1);
+    make_variant_test!(test_ref_ot_chr11_134473154_g_a_homo,            "ref_ot_chr11_134473154_G_A_homo.bam",            134473154, "G", "A",      ReadNumber::R1);
+    make_variant_test!(test_ref_ot_chr11_8195526_g_a_het,               "ref_ot_chr11_8195526_G_A_het.bam",               8195526,   "G", "A",      ReadNumber::R1);
 
     fn load_ref_seq(contig: &str) -> Vec<u8> {
         let ref_reader =
@@ -2874,98 +2489,87 @@ mod tests {
             "Expected no tumor variants after matched-normal filtering when using identical BAMs"
         );
     }
-}
 
-// ---------------------------------------------------------------------------
-// Indel filter unit tests (outside the cfg(test) module so they use the same
-// helper types defined at crate level)
-// ---------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Indel filter unit tests
+    // -----------------------------------------------------------------------
 
-#[cfg(test)]
-struct Qualities(Vec<u8>);
+    #[test]
+    fn test_homopolymer_read_start() {
+        let cigar = bam::record::CigarString::from(vec![Cigar::Match(7)]);
+        let mut rec = bam::Record::new();
+        let seq = b"AAATGCC";
+        rec.set(b"r", Some(&cigar), seq, &[255u8; 7]);
+        assert!(filter_indels(seq, &rec, 3, 4));
 
-#[cfg(test)]
-impl Qualities {
-    fn from_bytes(bytes: Vec<u8>) -> Self {
-        Qualities(bytes)
+        let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+        let mut rec2 = bam::Record::new();
+        let seq2 = b"AATGCC";
+        rec2.set(b"r", Some(&cigar2), seq2, &[255u8; 6]);
+        assert!(!filter_indels(seq2, &rec2, 3, 4));
     }
-}
 
-#[test]
-fn test_homopolymer_read_start() {
-    let cigar = bam::record::CigarString::from(vec![Cigar::Match(7)]);
-    let mut rec = bam::Record::new();
-    let seq = b"AAATGCC";
-    rec.set(b"r", Some(&cigar), seq, &Qualities::from_bytes(vec![255; 7]).0);
-    assert!(filter_indels(seq, &rec, 3, 4));
+    #[test]
+    fn test_homopolymer_read_end() {
+        let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+        let mut rec = bam::Record::new();
+        let seq = b"GCCTTT";
+        rec.set(b"r", Some(&cigar), seq, &[255u8; 6]);
+        assert!(filter_indels(seq, &rec, 3, 4));
 
-    let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
-    let mut rec2 = bam::Record::new();
-    let seq2 = b"AATGCC";
-    rec2.set(b"r", Some(&cigar2), seq2, &Qualities::from_bytes(vec![255; 6]).0);
-    assert!(!filter_indels(seq2, &rec2, 3, 4));
-}
+        let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(5)]);
+        let mut rec2 = bam::Record::new();
+        let seq2 = b"GCCTT";
+        rec2.set(b"r", Some(&cigar2), seq2, &[255u8; 5]);
+        assert!(!filter_indels(seq2, &rec2, 3, 4));
+    }
 
-#[test]
-fn test_homopolymer_read_end() {
-    let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
-    let mut rec = bam::Record::new();
-    let seq = b"GCCTTT";
-    rec.set(b"r", Some(&cigar), seq, &Qualities::from_bytes(vec![255; 6]).0);
-    assert!(filter_indels(seq, &rec, 3, 4));
+    #[test]
+    fn test_dinucleotide_read_start() {
+        let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+        let mut rec = bam::Record::new();
+        let seq = b"ATATGC";
+        rec.set(b"r", Some(&cigar), seq, &[255u8; 6]);
+        assert!(filter_indels(seq, &rec, 3, 4));
 
-    let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(5)]);
-    let mut rec2 = bam::Record::new();
-    let seq2 = b"GCCTT";
-    rec2.set(b"r", Some(&cigar2), seq2, &Qualities::from_bytes(vec![255; 5]).0);
-    assert!(!filter_indels(seq2, &rec2, 3, 4));
-}
+        let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+        let mut rec2 = bam::Record::new();
+        let seq2 = b"ATCGTG";
+        rec2.set(b"r", Some(&cigar2), seq2, &[255u8; 6]);
+        assert!(!filter_indels(seq2, &rec2, 3, 4));
+    }
 
-#[test]
-fn test_dinucleotide_read_start() {
-    let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
-    let mut rec = bam::Record::new();
-    let seq = b"ATATGC";
-    rec.set(b"r", Some(&cigar), seq, &Qualities::from_bytes(vec![255; 6]).0);
-    assert!(filter_indels(seq, &rec, 3, 4));
+    #[test]
+    fn test_dinucleotide_read_end() {
+        let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+        let mut rec = bam::Record::new();
+        let seq = b"GCCTTT";
+        rec.set(b"r", Some(&cigar), seq, &[255u8; 6]);
+        assert!(filter_indels(seq, &rec, 3, 4));
 
-    let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
-    let mut rec2 = bam::Record::new();
-    let seq2 = b"ATCGTG";
-    rec2.set(b"r", Some(&cigar2), seq2, &Qualities::from_bytes(vec![255; 6]).0);
-    assert!(!filter_indels(seq2, &rec2, 3, 4));
-}
+        let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
+        let mut rec2 = bam::Record::new();
+        let seq2 = b"GCCTTG";
+        rec2.set(b"r", Some(&cigar2), seq2, &[255u8; 6]);
+        assert!(!filter_indels(seq2, &rec2, 3, 4));
+    }
 
-#[test]
-fn test_dinucleotide_read_end() {
-    let cigar = bam::record::CigarString::from(vec![Cigar::Match(6)]);
-    let mut rec = bam::Record::new();
-    let seq = b"GCCTTT";
-    rec.set(b"r", Some(&cigar), seq, &Qualities::from_bytes(vec![255; 6]).0);
-    assert!(filter_indels(seq, &rec, 3, 4));
+    #[test]
+    fn test_check_soft_clip() {
+        let cigar_sc = bam::record::CigarString::from(vec![
+            Cigar::SoftClip(5),
+            Cigar::Match(10),
+            Cigar::SoftClip(3),
+        ]);
+        let mut rec = bam::Record::new();
+        let seq = b"ACGTACGTAC";
+        let qual = vec![255u8; 10];
+        rec.set(b"r", Some(&cigar_sc), seq, &qual);
+        assert!(filter_indels(seq, &rec, 3, 4));
 
-    let cigar2 = bam::record::CigarString::from(vec![Cigar::Match(6)]);
-    let mut rec2 = bam::Record::new();
-    let seq2 = b"GCCTTG";
-    rec2.set(b"r", Some(&cigar2), seq2, &Qualities::from_bytes(vec![255; 6]).0);
-    assert!(!filter_indels(seq2, &rec2, 3, 4));
-}
-
-#[test]
-fn test_check_soft_clip() {
-    let cigar_sc = bam::record::CigarString::from(vec![
-        Cigar::SoftClip(5),
-        Cigar::Match(10),
-        Cigar::SoftClip(3),
-    ]);
-    let mut rec = bam::Record::new();
-    let seq = b"ACGTACGTAC";
-    let qual = Qualities::from_bytes(vec![255; 10]).0;
-    rec.set(b"r", Some(&cigar_sc), seq, &qual);
-    assert!(filter_indels(seq, &rec, 3, 4));
-
-    let cigar_no_sc = bam::record::CigarString::from(vec![Cigar::Match(10)]);
-    let mut rec2 = bam::Record::new();
-    rec2.set(b"r", Some(&cigar_no_sc), seq, &qual);
-    assert!(!filter_indels(seq, &rec2, 3, 4));
+        let cigar_no_sc = bam::record::CigarString::from(vec![Cigar::Match(10)]);
+        let mut rec2 = bam::Record::new();
+        rec2.set(b"r", Some(&cigar_no_sc), seq, &qual);
+        assert!(!filter_indels(seq, &rec2, 3, 4));
+    }
 }
