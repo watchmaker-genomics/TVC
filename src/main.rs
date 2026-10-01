@@ -47,11 +47,13 @@ const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
 #[cfg(feature = "onnx-inference")]
 const BASE_FEATURE_NAMES: &[&str] = &[
     "DP", "AO", "ER", "PR",
-    "AMQR", "AMQA", "ABQR", "ABQA",
-    "REDR", "REDA", "ISR", "ISA",
+    "AMQR_R1", "AMQR_R2", "AMQA_R1", "AMQA_R2",
+    "ABQR_R1", "ABQR_R2", "ABQA_R1", "ABQA_R2",
+    "REDR_R1", "REDR_R2", "REDA_R1", "REDA_R2",
+    "ISR", "ISA",
     "FWDP", "REVP", "LLE", "SLE",
-    "AMPR", "ARL",
-    "FWD", "REV", "TOT",
+    "AMPR_R1", "AMPR_R2", "ARL_R1", "ARL_R2",
+    "FWD_R1", "FWD_R2", "REV_R1", "REV_R2", "TOT_R1", "TOT_R2",
     "AF", "strand_bias",
 ];
 
@@ -59,6 +61,12 @@ const BASE_FEATURE_NAMES: &[&str] = &[
 pub enum ReadNumber {
     R1,
     R2,
+}
+
+#[derive(Debug, Clone, PartialEq, ValueEnum)]
+enum SequencingMode {
+    SingleEnd,
+    PairedEnd,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -129,6 +137,9 @@ struct Args {
     #[arg(short = 'r', long, value_enum, default_value_t = ReadNumber::R1)]
     stranded_read: ReadNumber,
 
+    #[arg(long = "sequencing-mode", value_enum, default_value_t = SequencingMode::PairedEnd)]
+    sequencing_mode: SequencingMode,
+
     #[arg(short = 'l', long, value_enum, default_value_t = LogLevel::Info)]
     log_level: LogLevel,
 
@@ -175,8 +186,24 @@ struct Variant {
     average_alt_mapq: f64,
     average_ref_bq: f64,
     average_alt_bq: f64,
+    average_ref_mapq_r1: f64,
+    average_ref_mapq_r2: f64,
+    average_alt_mapq_r1: f64,
+    average_alt_mapq_r2: f64,
+    average_ref_bq_r1: f64,
+    average_ref_bq_r2: f64,
+    average_alt_bq_r1: f64,
+    average_alt_bq_r2: f64,
     avg_ref_dist_from_read_end: f64,
     avg_alt_dist_from_read_end: f64,
+    #[cfg_attr(not(feature = "onnx-inference"), allow(dead_code))]
+    avg_ref_dist_from_read_end_r1: f64,
+    #[cfg_attr(not(feature = "onnx-inference"), allow(dead_code))]
+    avg_ref_dist_from_read_end_r2: f64,
+    #[cfg_attr(not(feature = "onnx-inference"), allow(dead_code))]
+    avg_alt_dist_from_read_end_r1: f64,
+    #[cfg_attr(not(feature = "onnx-inference"), allow(dead_code))]
+    avg_alt_dist_from_read_end_r2: f64,
     avg_ref_insert_size: f64,
     avg_alt_insert_size: f64,
     fwd_probability: f64,
@@ -184,11 +211,23 @@ struct Variant {
     large_local_entropy: f64,
     small_local_entropy: f64,
     avg_mismatch_per_read: f64,
+    avg_mismatch_per_read_r1: f64,
+    avg_mismatch_per_read_r2: f64,
     avg_read_length: f64,
+    avg_read_length_r1: f64,
+    avg_read_length_r2: f64,
     alt_forward_count: u32,
+    alt_forward_count_r1: u32,
+    alt_forward_count_r2: u32,
     alt_reverse_count: u32,
+    alt_reverse_count_r1: u32,
+    alt_reverse_count_r2: u32,
     ref_forward_count: u32,
+    ref_forward_count_r1: u32,
+    ref_forward_count_r2: u32,
     ref_reverse_count: u32,
+    ref_reverse_count_r1: u32,
+    ref_reverse_count_r2: u32,
     model_probability: f64,
     strand_bias: f64,
 }
@@ -231,6 +270,10 @@ impl Variant {
 
     /// Render this variant as a VCF record line (newline-terminated).
     fn to_vcf(&self) -> String {
+        self.to_vcf_for_mode(&SequencingMode::PairedEnd)
+    }
+
+    fn to_vcf_for_mode(&self, sequencing_mode: &SequencingMode) -> String {
         let cd = match self.calling_directive {
             CallingDirective::ReferenceSiteOb => "REF_OB",
             CallingDirective::DenovoSiteOb => "DENOVO_OB",
@@ -246,47 +289,109 @@ impl Variant {
         let rev_prob = self.rev_probability.max(1e-300);
         let alt_total = self.alt_forward_count + self.alt_reverse_count;
 
-        format!(
-            "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tVT={vt};CD={cd};LRP={lrp:.4}\t\
-GT:DP:AO:ER:TNC:PR:AMQR:AMQA:ABQR:ABQA:REDR:REDA:ISR:ISA:\
-    FWDP:REVP:LLE:SLE:AMPR:ARL:FWD:REV:TOT:STB\t\
+        match sequencing_mode {
+            SequencingMode::PairedEnd => format!(
+                "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tVT={vt};CD={cd};LRP={lrp:.4}\t\
+GT:DP:AO:ER:TNC:PR:AMQR:AMQA:AMQR_R1:AMQR_R2:AMQA_R1:AMQA_R2:ABQR:ABQA:ABQR_R1:ABQR_R2:ABQA_R1:ABQA_R2:\
+REDR:REDA:REDR_R1:REDR_R2:REDA_R1:REDA_R2:ISR:ISA:FWDP:REVP:LLE:SLE:AMPR:AMPR_R1:AMPR_R2:ARL:ARL_R1:ARL_R2:\
+FWD:REV:TOT:FWD_R1:FWD_R2:REV_R1:REV_R2:TOT_R1:TOT_R2:STB\t\
 {gt}:{dp}:{ao}:{er:.3E}:{tnc}:{pr:.3E}:\
-{amqr:.1}:{amqa:.1}:{abqr:.1}:{abqa:.1}:{redr:.1}:{reda:.1}:{isr:.1}:{isa:.1}:\
-{fwdp:.3E}:{revp:.3E}:{lle:.3}:{sle:.1}:{ampr:.1}:{arl:.1}:\
-{fwd:.1}:{rev:.1}:{tot:.1}:{stb:.3E}\n",
-            chrom = self.contig,
-            pos   = self.pos,
-            ref   = self.reference,
-            alt   = self.alt,
-            qual  = self.score.round(),
-            vt    = self.infer_variant_type(),
-            cd    = cd,
-            lrp   = self.model_probability,
-            gt    = self.genotype,
-            dp    = self.depth,
-            ao    = self.alt_counts,
-            er    = self.error_rate,
-            tnc   = self.tnc_display(),
-            pr    = prob,
-            amqr  = self.average_ref_mapq,
-            amqa  = self.average_alt_mapq,
-            abqr  = self.average_ref_bq,
-            abqa  = self.average_alt_bq,
-            redr  = self.avg_ref_dist_from_read_end,
-            reda  = self.avg_alt_dist_from_read_end,
-            isr   = self.avg_ref_insert_size,
-            isa   = self.avg_alt_insert_size,
-            fwdp  = fwd_prob,
-            revp  = rev_prob,
-            lle   = self.large_local_entropy,
-            sle   = self.small_local_entropy,
-            ampr  = self.avg_mismatch_per_read,
-            arl   = self.avg_read_length,
-            fwd   = self.alt_forward_count,
-            rev   = self.alt_reverse_count,
-            tot   = alt_total,
-            stb   = self.strand_bias,
-        )
+{amqr:.1}:{amqa:.1}:{amqr_r1:.1}:{amqr_r2:.1}:{amqa_r1:.1}:{amqa_r2:.1}:{abqr:.1}:{abqa:.1}:{abqr_r1:.1}:{abqr_r2:.1}:{abqa_r1:.1}:{abqa_r2:.1}:\
+{redr:.1}:{reda:.1}:{redr_r1:.1}:{redr_r2:.1}:{reda_r1:.1}:{reda_r2:.1}:{isr:.1}:{isa:.1}:{fwdp:.3E}:{revp:.3E}:{lle:.3}:{sle:.1}:{ampr:.1}:{ampr_r1:.1}:{ampr_r2:.1}:{arl:.1}:{arl_r1:.1}:{arl_r2:.1}:\
+{fwd:.1}:{rev:.1}:{tot:.1}:{fwd_r1:.1}:{fwd_r2:.1}:{rev_r1:.1}:{rev_r2:.1}:{tot_r1:.1}:{tot_r2:.1}:{stb:.3E}\n",
+                chrom = self.contig,
+                pos   = self.pos,
+                ref   = self.reference,
+                alt   = self.alt,
+                qual  = self.score.round(),
+                vt    = self.infer_variant_type(),
+                cd    = cd,
+                lrp   = self.model_probability,
+                gt    = self.genotype,
+                dp    = self.depth,
+                ao    = self.alt_counts,
+                er    = self.error_rate,
+                tnc   = self.tnc_display(),
+                pr    = prob,
+                amqr  = self.average_ref_mapq,
+                amqa  = self.average_alt_mapq,
+                amqr_r1 = self.average_ref_mapq_r1,
+                amqr_r2 = self.average_ref_mapq_r2,
+                amqa_r1 = self.average_alt_mapq_r1,
+                amqa_r2 = self.average_alt_mapq_r2,
+                abqr  = self.average_ref_bq,
+                abqa  = self.average_alt_bq,
+                abqr_r1 = self.average_ref_bq_r1,
+                abqr_r2 = self.average_ref_bq_r2,
+                abqa_r1 = self.average_alt_bq_r1,
+                abqa_r2 = self.average_alt_bq_r2,
+                redr  = self.avg_ref_dist_from_read_end,
+                reda  = self.avg_alt_dist_from_read_end,
+                redr_r1 = self.avg_ref_dist_from_read_end_r1,
+                redr_r2 = self.avg_ref_dist_from_read_end_r2,
+                reda_r1 = self.avg_alt_dist_from_read_end_r1,
+                reda_r2 = self.avg_alt_dist_from_read_end_r2,
+                isr   = self.avg_ref_insert_size,
+                isa   = self.avg_alt_insert_size,
+                fwdp  = fwd_prob,
+                revp  = rev_prob,
+                lle   = self.large_local_entropy,
+                sle   = self.small_local_entropy,
+                ampr  = self.avg_mismatch_per_read,
+                ampr_r1 = self.avg_mismatch_per_read_r1,
+                ampr_r2 = self.avg_mismatch_per_read_r2,
+                arl   = self.avg_read_length,
+                arl_r1 = self.avg_read_length_r1,
+                arl_r2 = self.avg_read_length_r2,
+                fwd   = self.alt_forward_count,
+                rev   = self.alt_reverse_count,
+                tot   = alt_total,
+                fwd_r1 = self.alt_forward_count_r1,
+                fwd_r2 = self.alt_forward_count_r2,
+                rev_r1 = self.alt_reverse_count_r1,
+                rev_r2 = self.alt_reverse_count_r2,
+                tot_r1 = self.alt_forward_count_r1 + self.alt_reverse_count_r1,
+                tot_r2 = self.alt_forward_count_r2 + self.alt_reverse_count_r2,
+                stb   = self.strand_bias,
+            ),
+            SequencingMode::SingleEnd => format!(
+                "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tVT={vt};CD={cd};LRP={lrp:.4}\t\
+GT:DP:AO:ER:TNC:PR:AMQR:AMQA:ABQR:ABQA:REDR:REDA:ISR:ISA:FWDP:REVP:LLE:SLE:AMPR:ARL:FWD:REV:TOT:STB\t\
+{gt}:{dp}:{ao}:{er:.3E}:{tnc}:{pr:.3E}:{amqr:.1}:{amqa:.1}:{abqr:.1}:{abqa:.1}:{redr:.1}:{reda:.1}:{isr:.1}:{isa:.1}:{fwdp:.3E}:{revp:.3E}:{lle:.3}:{sle:.1}:{ampr:.1}:{arl:.1}:{fwd:.1}:{rev:.1}:{tot:.1}:{stb:.3E}\n",
+                chrom = self.contig,
+                pos   = self.pos,
+                ref   = self.reference,
+                alt   = self.alt,
+                qual  = self.score.round(),
+                vt    = self.infer_variant_type(),
+                cd    = cd,
+                lrp   = self.model_probability,
+                gt    = self.genotype,
+                dp    = self.depth,
+                ao    = self.alt_counts,
+                er    = self.error_rate,
+                tnc   = self.tnc_display(),
+                pr    = prob,
+                amqr  = self.average_ref_mapq,
+                amqa  = self.average_alt_mapq,
+                abqr  = self.average_ref_bq,
+                abqa  = self.average_alt_bq,
+                redr  = self.avg_ref_dist_from_read_end,
+                reda  = self.avg_alt_dist_from_read_end,
+                isr   = self.avg_ref_insert_size,
+                isa   = self.avg_alt_insert_size,
+                fwdp  = fwd_prob,
+                revp  = rev_prob,
+                lle   = self.large_local_entropy,
+                sle   = self.small_local_entropy,
+                ampr  = self.avg_mismatch_per_read,
+                arl   = self.avg_read_length,
+                fwd   = self.alt_forward_count,
+                rev   = self.alt_reverse_count,
+                tot   = alt_total,
+                stb   = self.strand_bias,
+            ),
+        }
     }
 }
 
@@ -620,6 +725,10 @@ fn find_where_to_call_variants(
 /// # Returns
 /// A string representing the VCF header
 fn get_vcf_header(header: &bam::HeaderView) -> String {
+    get_vcf_header_for_mode(header, &SequencingMode::PairedEnd)
+}
+
+fn get_vcf_header_for_mode(header: &bam::HeaderView, sequencing_mode: &SequencingMode) -> String {
     let contigs = header
         .target_names()
         .iter()
@@ -631,38 +740,87 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
+    let format_lines = match sequencing_mode {
+        SequencingMode::PairedEnd => concat!(
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
+            "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n",
+            "##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n",
+            "##FORMAT=<ID=ER,Number=1,Type=Float,Description=\"Estimated Error Rate\">\n",
+            "##FORMAT=<ID=TNC,Number=1,Type=String,Description=\"Trinucleotide Context (SNPs: up(ref>alt)down; non-SNPs: upstream,ref,downstream)\">\n",
+            "##FORMAT=<ID=PR,Number=1,Type=Float,Description=\"Aggregate right-tail binomial evidence score for the emitted call\">\n",
+            "##FORMAT=<ID=AMQR,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the reference allele\">\n",
+            "##FORMAT=<ID=AMQA,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the alternate allele\">\n",
+            "##FORMAT=<ID=AMQR_R1,Number=1,Type=Float,Description=\"Average mapping quality of reference-supporting R1 reads\">\n",
+            "##FORMAT=<ID=AMQR_R2,Number=1,Type=Float,Description=\"Average mapping quality of reference-supporting R2 reads\">\n",
+            "##FORMAT=<ID=AMQA_R1,Number=1,Type=Float,Description=\"Average mapping quality of alternate-supporting R1 reads\">\n",
+            "##FORMAT=<ID=AMQA_R2,Number=1,Type=Float,Description=\"Average mapping quality of alternate-supporting R2 reads\">\n",
+            "##FORMAT=<ID=ABQR,Number=1,Type=Float,Description=\"Average base quality of reads supporting the reference allele\">\n",
+            "##FORMAT=<ID=ABQA,Number=1,Type=Float,Description=\"Average base quality of reads supporting the alternate allele\">\n",
+            "##FORMAT=<ID=ABQR_R1,Number=1,Type=Float,Description=\"Average base quality of reference-supporting R1 reads\">\n",
+            "##FORMAT=<ID=ABQR_R2,Number=1,Type=Float,Description=\"Average base quality of reference-supporting R2 reads\">\n",
+            "##FORMAT=<ID=ABQA_R1,Number=1,Type=Float,Description=\"Average base quality of alternate-supporting R1 reads\">\n",
+            "##FORMAT=<ID=ABQA_R2,Number=1,Type=Float,Description=\"Average base quality of alternate-supporting R2 reads\">\n",
+            "##FORMAT=<ID=REDR,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the reference allele\">\n",
+            "##FORMAT=<ID=REDA,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n",
+            "##FORMAT=<ID=REDR_R1,Number=1,Type=Float,Description=\"Average distance from read end for reference-supporting R1 reads\">\n",
+            "##FORMAT=<ID=REDR_R2,Number=1,Type=Float,Description=\"Average distance from read end for reference-supporting R2 reads\">\n",
+            "##FORMAT=<ID=REDA_R1,Number=1,Type=Float,Description=\"Average distance from read end for alternate-supporting R1 reads\">\n",
+            "##FORMAT=<ID=REDA_R2,Number=1,Type=Float,Description=\"Average distance from read end for alternate-supporting R2 reads\">\n",
+            "##FORMAT=<ID=ISR,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n",
+            "##FORMAT=<ID=ISA,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n",
+            "##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Fraction of strand-separated aggregate evidence contributed by forward reads\">\n",
+            "##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Fraction of strand-separated aggregate evidence contributed by reverse reads\">\n",
+            "##FORMAT=<ID=LLE,Number=1,Type=Float,Description=\"Large local sequence entropy (50 bp on either side)\">\n",
+            "##FORMAT=<ID=SLE,Number=1,Type=Float,Description=\"Small local sequence entropy (15 bp on either side)\">\n",
+            "##FORMAT=<ID=AMPR,Number=1,Type=Float,Description=\"Average mismatches per read at the position\">\n",
+            "##FORMAT=<ID=AMPR_R1,Number=1,Type=Float,Description=\"Average mismatches per read for R1 reads at the position\">\n",
+            "##FORMAT=<ID=AMPR_R2,Number=1,Type=Float,Description=\"Average mismatches per read for R2 reads at the position\">\n",
+            "##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n",
+            "##FORMAT=<ID=ARL_R1,Number=1,Type=Float,Description=\"Average read length for R1 reads covering the position\">\n",
+            "##FORMAT=<ID=ARL_R2,Number=1,Type=Float,Description=\"Average read length for R2 reads covering the position\">\n",
+            "##FORMAT=<ID=FWD,Number=1,Type=Float,Description=\"Alternate-supporting forward-strand read count\">\n",
+            "##FORMAT=<ID=FWD_R1,Number=1,Type=Float,Description=\"Alternate-supporting forward-strand R1 read count\">\n",
+            "##FORMAT=<ID=FWD_R2,Number=1,Type=Float,Description=\"Alternate-supporting forward-strand R2 read count\">\n",
+            "##FORMAT=<ID=REV,Number=1,Type=Float,Description=\"Alternate-supporting reverse-strand read count\">\n",
+            "##FORMAT=<ID=REV_R1,Number=1,Type=Float,Description=\"Alternate-supporting reverse-strand R1 read count\">\n",
+            "##FORMAT=<ID=REV_R2,Number=1,Type=Float,Description=\"Alternate-supporting reverse-strand R2 read count\">\n",
+            "##FORMAT=<ID=TOT,Number=1,Type=Float,Description=\"Total alternate-supporting read count across both strands\">\n",
+            "##FORMAT=<ID=TOT_R1,Number=1,Type=Float,Description=\"Total alternate-supporting R1 read count\">\n",
+            "##FORMAT=<ID=TOT_R2,Number=1,Type=Float,Description=\"Total alternate-supporting R2 read count\">\n",
+            "##FORMAT=<ID=STB,Number=1,Type=Float,Description=\"Fisher exact strand-bias p-value for reference versus alternate support\">\n"
+        ),
+        SequencingMode::SingleEnd => concat!(
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n",
+            "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n",
+            "##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n",
+            "##FORMAT=<ID=ER,Number=1,Type=Float,Description=\"Estimated Error Rate\">\n",
+            "##FORMAT=<ID=TNC,Number=1,Type=String,Description=\"Trinucleotide Context (SNPs: up(ref>alt)down; non-SNPs: upstream,ref,downstream)\">\n",
+            "##FORMAT=<ID=PR,Number=1,Type=Float,Description=\"Aggregate right-tail binomial evidence score for the emitted call\">\n",
+            "##FORMAT=<ID=AMQR,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the reference allele\">\n",
+            "##FORMAT=<ID=AMQA,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the alternate allele\">\n",
+            "##FORMAT=<ID=ABQR,Number=1,Type=Float,Description=\"Average base quality of reads supporting the reference allele\">\n",
+            "##FORMAT=<ID=ABQA,Number=1,Type=Float,Description=\"Average base quality of reads supporting the alternate allele\">\n",
+            "##FORMAT=<ID=REDR,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the reference allele\">\n",
+            "##FORMAT=<ID=REDA,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n",
+            "##FORMAT=<ID=ISR,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n",
+            "##FORMAT=<ID=ISA,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n",
+            "##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Fraction of strand-separated aggregate evidence contributed by forward reads\">\n",
+            "##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Fraction of strand-separated aggregate evidence contributed by reverse reads\">\n",
+            "##FORMAT=<ID=LLE,Number=1,Type=Float,Description=\"Large local sequence entropy (50 bp on either side)\">\n",
+            "##FORMAT=<ID=SLE,Number=1,Type=Float,Description=\"Small local sequence entropy (15 bp on either side)\">\n",
+            "##FORMAT=<ID=AMPR,Number=1,Type=Float,Description=\"Average mismatches per read at the position\">\n",
+            "##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n",
+            "##FORMAT=<ID=FWD,Number=1,Type=Float,Description=\"Alternate-supporting forward-strand read count\">\n",
+            "##FORMAT=<ID=REV,Number=1,Type=Float,Description=\"Alternate-supporting reverse-strand read count\">\n",
+            "##FORMAT=<ID=TOT,Number=1,Type=Float,Description=\"Total alternate-supporting read count across both strands\">\n",
+            "##FORMAT=<ID=STB,Number=1,Type=Float,Description=\"Fisher exact strand-bias p-value for reference versus alternate support\">\n"
+        ),
+    };
+
     format!(
-        "##fileformat=VCFv4.3\n\
-        {}\n\
-##INFO=<ID=VT,Number=1,Type=String,Description=\"Variant Type\">\n\
-##INFO=<ID=CD,Number=1,Type=String,Description=\"TVC Call Directive\">\n\
-##INFO=<ID=LRP,Number=1,Type=Float,Description=\"ML model probability for this call\">\n\
-##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
-##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n\
-##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n\
-##FORMAT=<ID=ER,Number=1,Type=Float,Description=\"Estimated Error Rate\">\n\
-##FORMAT=<ID=TNC,Number=1,Type=String,Description=\"Trinucleotide Context (SNPs: up(ref>alt)down; non-SNPs: upstream,ref,downstream)\">\n\
-##FORMAT=<ID=PR,Number=1,Type=Float,Description=\"Aggregate right-tail binomial evidence score for the emitted call\">\n\
-##FORMAT=<ID=AMQR,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the reference allele\">\n\
-##FORMAT=<ID=AMQA,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the alternate allele\">\n\
-##FORMAT=<ID=ABQR,Number=1,Type=Float,Description=\"Average base quality of reads supporting the reference allele\">\n\
-##FORMAT=<ID=ABQA,Number=1,Type=Float,Description=\"Average base quality of reads supporting the alternate allele\">\n\
-##FORMAT=<ID=REDR,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the reference allele\">\n\
-##FORMAT=<ID=REDA,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n\
-##FORMAT=<ID=ISR,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n\
-##FORMAT=<ID=ISA,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n\
-##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Fraction of strand-separated aggregate evidence contributed by forward reads\">\n\
-##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Fraction of strand-separated aggregate evidence contributed by reverse reads\">\n\
-##FORMAT=<ID=LLE,Number=1,Type=Float,Description=\"Large local sequence entropy (50 bp on either side)\">\n\
-##FORMAT=<ID=SLE,Number=1,Type=Float,Description=\"Small local sequence entropy (15 bp on either side)\">\n\
-##FORMAT=<ID=AMPR,Number=1,Type=Float,Description=\"Average mismatches per read at the position\">\n\
-##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n\
-##FORMAT=<ID=FWD,Number=1,Type=Float,Description=\"Alternate-supporting forward-strand read count\">\n\
-##FORMAT=<ID=REV,Number=1,Type=Float,Description=\"Alternate-supporting reverse-strand read count\">\n\
-##FORMAT=<ID=TOT,Number=1,Type=Float,Description=\"Total alternate-supporting read count across both strands\">\n\
-##FORMAT=<ID=STB,Number=1,Type=Float,Description=\"Fisher exact strand-bias p-value for reference versus alternate support\">\n\
-#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
-        contigs
+        "##fileformat=VCFv4.3\n{}\n##INFO=<ID=VT,Number=1,Type=String,Description=\"Variant Type\">\n##INFO=<ID=CD,Number=1,Type=String,Description=\"TVC Call Directive\">\n##INFO=<ID=LRP,Number=1,Type=Float,Description=\"ML model probability for this call\">\n{}#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
+        contigs,
+        format_lines,
     )
 }
 
@@ -730,6 +888,19 @@ fn strand_bias_fisher_pvalue(variant: &Variant) -> f64 {
     }
 
     fisher_exact_test(alt_fwd, ref_fwd, alt_rev, ref_rev)
+}
+
+fn read_number_of(record: &bam::Record, sequencing_mode: &SequencingMode) -> ReadNumber {
+    match sequencing_mode {
+        SequencingMode::SingleEnd => ReadNumber::R1,
+        SequencingMode::PairedEnd => {
+            if record.is_last_in_template() {
+                ReadNumber::R2
+            } else {
+                ReadNumber::R1
+            }
+        }
+    }
 }
 
 fn get_count_vec_candidates(
@@ -904,19 +1075,34 @@ fn build_model_feature_map(v: &Variant) -> HashMap<String, f64> {
     values.insert("AMQA".to_string(), v.average_alt_mapq);
     values.insert("ABQR".to_string(), v.average_ref_bq);
     values.insert("ABQA".to_string(), v.average_alt_bq);
-    values.insert("REDR".to_string(), v.avg_ref_dist_from_read_end);
-    values.insert("REDA".to_string(), v.avg_alt_dist_from_read_end);
+    values.insert("AMQR_R1".to_string(), v.average_ref_mapq_r1);
+    values.insert("AMQR_R2".to_string(), v.average_ref_mapq_r2);
+    values.insert("AMQA_R1".to_string(), v.average_alt_mapq_r1);
+    values.insert("AMQA_R2".to_string(), v.average_alt_mapq_r2);
+    values.insert("ABQR_R1".to_string(), v.average_ref_bq_r1);
+    values.insert("ABQR_R2".to_string(), v.average_ref_bq_r2);
+    values.insert("ABQA_R1".to_string(), v.average_alt_bq_r1);
+    values.insert("ABQA_R2".to_string(), v.average_alt_bq_r2);
+    values.insert("REDR_R1".to_string(), v.avg_ref_dist_from_read_end_r1);
+    values.insert("REDR_R2".to_string(), v.avg_ref_dist_from_read_end_r2);
+    values.insert("REDA_R1".to_string(), v.avg_alt_dist_from_read_end_r1);
+    values.insert("REDA_R2".to_string(), v.avg_alt_dist_from_read_end_r2);
     values.insert("ISR".to_string(), v.avg_ref_insert_size);
     values.insert("ISA".to_string(), v.avg_alt_insert_size);
     values.insert("FWDP".to_string(), v.fwd_probability);
     values.insert("REVP".to_string(), v.rev_probability);
     values.insert("LLE".to_string(), v.large_local_entropy);
     values.insert("SLE".to_string(), v.small_local_entropy);
-    values.insert("AMPR".to_string(), v.avg_mismatch_per_read);
-    values.insert("ARL".to_string(), v.avg_read_length);
-    values.insert("FWD".to_string(), v.alt_forward_count as f64);
-    values.insert("REV".to_string(), v.alt_reverse_count as f64);
-    values.insert("TOT".to_string(), (v.alt_forward_count + v.alt_reverse_count) as f64);
+    values.insert("AMPR_R1".to_string(), v.avg_mismatch_per_read_r1);
+    values.insert("AMPR_R2".to_string(), v.avg_mismatch_per_read_r2);
+    values.insert("ARL_R1".to_string(), v.avg_read_length_r1);
+    values.insert("ARL_R2".to_string(), v.avg_read_length_r2);
+    values.insert("FWD_R1".to_string(), v.alt_forward_count_r1 as f64);
+    values.insert("FWD_R2".to_string(), v.alt_forward_count_r2 as f64);
+    values.insert("REV_R1".to_string(), v.alt_reverse_count_r1 as f64);
+    values.insert("REV_R2".to_string(), v.alt_reverse_count_r2 as f64);
+    values.insert("TOT_R1".to_string(), (v.alt_forward_count_r1 + v.alt_reverse_count_r1) as f64);
+    values.insert("TOT_R2".to_string(), (v.alt_forward_count_r2 + v.alt_reverse_count_r2) as f64);
     values.insert("AF".to_string(), af);
     // REVIEW: change this to a fisher's exact test
     values.insert("strand_bias".to_string(), strand_bias);
@@ -1340,11 +1526,12 @@ fn get_nm_tag(record: &bam::Record) -> u32 {
 ///
 /// # Returns
 /// True if the read is the stranded one
-fn is_stranded_read(record: &bam::Record, stranded_read: &ReadNumber) -> bool {
-    let read_orientation = match record.is_last_in_template() {
-        true => ReadNumber::R2,
-        false => ReadNumber::R1,
-    };
+fn is_stranded_read(
+    record: &bam::Record,
+    stranded_read: &ReadNumber,
+    sequencing_mode: &SequencingMode,
+) -> bool {
+    let read_orientation = read_number_of(record, sequencing_mode);
 
     read_orientation == *stranded_read
 }
@@ -1472,16 +1659,36 @@ fn flank_entropy(ref_seq: &[u8], pos: usize, flank: usize) -> f64 {
 struct PileupStats {
     ref_dist_from_read_end: f64,
     alt_dist_from_read_end: f64,
+    ref_dist_from_read_end_r1: f64,
+    ref_dist_from_read_end_r2: f64,
+    alt_dist_from_read_end_r1: f64,
+    alt_dist_from_read_end_r2: f64,
     ref_insert_size_sum: f64,
     alt_insert_size_sum: f64,
     total_alt_counts: f64,
     total_ref_counts: f64,
+    total_alt_counts_r1: f64,
+    total_alt_counts_r2: f64,
+    total_ref_counts_r1: f64,
+    total_ref_counts_r2: f64,
     count_ref_mapq: f64,
     count_alt_mapq: f64,
+    count_ref_mapq_r1: f64,
+    count_ref_mapq_r2: f64,
+    count_alt_mapq_r1: f64,
+    count_alt_mapq_r2: f64,
     count_ref_bq: f64,
     count_alt_bq: f64,
+    count_ref_bq_r1: f64,
+    count_ref_bq_r2: f64,
+    count_alt_bq_r1: f64,
+    count_alt_bq_r2: f64,
     total_mismatches: f64,
+    total_mismatches_r1: f64,
+    total_mismatches_r2: f64,
     total_read_length: f64,
+    total_read_length_r1: f64,
+    total_read_length_r2: f64,
     read_end_filtered_count_indels: f64,
     indel_offset: u64,
 }
@@ -1490,14 +1697,30 @@ struct PileupStats {
 struct SiteAverages {
     ref_mapq: f64,
     alt_mapq: f64,
+    ref_mapq_r1: f64,
+    ref_mapq_r2: f64,
+    alt_mapq_r1: f64,
+    alt_mapq_r2: f64,
     ref_bq: f64,
     alt_bq: f64,
+    ref_bq_r1: f64,
+    ref_bq_r2: f64,
+    alt_bq_r1: f64,
+    alt_bq_r2: f64,
     ref_dist: f64,
     alt_dist: f64,
+    ref_dist_r1: f64,
+    ref_dist_r2: f64,
+    alt_dist_r1: f64,
+    alt_dist_r2: f64,
     ref_ins: f64,
     alt_ins: f64,
     mismatch: f64,
+    mismatch_r1: f64,
+    mismatch_r2: f64,
     read_length: f64,
+    read_length_r1: f64,
+    read_length_r2: f64,
 }
 
 fn safe_div(num: f64, den: f64) -> f64 {
@@ -1511,17 +1734,35 @@ fn safe_div(num: f64, den: f64) -> f64 {
 impl PileupStats {
     fn averages(&self) -> SiteAverages {
         let total_reads = self.total_ref_counts + self.total_alt_counts;
+        let total_reads_r1 = self.total_ref_counts_r1 + self.total_alt_counts_r1;
+        let total_reads_r2 = self.total_ref_counts_r2 + self.total_alt_counts_r2;
         SiteAverages {
             ref_mapq: safe_div(self.count_ref_mapq, self.total_ref_counts),
             alt_mapq: safe_div(self.count_alt_mapq, self.total_alt_counts),
+            ref_mapq_r1: safe_div(self.count_ref_mapq_r1, self.total_ref_counts_r1),
+            ref_mapq_r2: safe_div(self.count_ref_mapq_r2, self.total_ref_counts_r2),
+            alt_mapq_r1: safe_div(self.count_alt_mapq_r1, self.total_alt_counts_r1),
+            alt_mapq_r2: safe_div(self.count_alt_mapq_r2, self.total_alt_counts_r2),
             ref_bq: safe_div(self.count_ref_bq, self.total_ref_counts),
             alt_bq: safe_div(self.count_alt_bq, self.total_alt_counts),
+            ref_bq_r1: safe_div(self.count_ref_bq_r1, self.total_ref_counts_r1),
+            ref_bq_r2: safe_div(self.count_ref_bq_r2, self.total_ref_counts_r2),
+            alt_bq_r1: safe_div(self.count_alt_bq_r1, self.total_alt_counts_r1),
+            alt_bq_r2: safe_div(self.count_alt_bq_r2, self.total_alt_counts_r2),
             ref_dist: safe_div(self.ref_dist_from_read_end, self.total_ref_counts),
             alt_dist: safe_div(self.alt_dist_from_read_end, self.total_alt_counts),
+            ref_dist_r1: safe_div(self.ref_dist_from_read_end_r1, self.total_ref_counts_r1),
+            ref_dist_r2: safe_div(self.ref_dist_from_read_end_r2, self.total_ref_counts_r2),
+            alt_dist_r1: safe_div(self.alt_dist_from_read_end_r1, self.total_alt_counts_r1),
+            alt_dist_r2: safe_div(self.alt_dist_from_read_end_r2, self.total_alt_counts_r2),
             ref_ins: safe_div(self.ref_insert_size_sum, self.total_ref_counts),
             alt_ins: safe_div(self.alt_insert_size_sum, self.total_alt_counts),
             mismatch: safe_div(self.total_mismatches, total_reads),
+            mismatch_r1: safe_div(self.total_mismatches_r1, total_reads_r1),
+            mismatch_r2: safe_div(self.total_mismatches_r2, total_reads_r2),
             read_length: safe_div(self.total_read_length, total_reads),
+            read_length_r1: safe_div(self.total_read_length_r1, total_reads_r1),
+            read_length_r2: safe_div(self.total_read_length_r2, total_reads_r2),
         }
     }
 }
@@ -1553,6 +1794,7 @@ fn compute_pileup_counts(
     ref_seq: &[u8],
     ref_pos: u32,
     stranded_read: &ReadNumber,
+    sequencing_mode: &SequencingMode,
     pileup_counts: &mut PileupCounts,
     indel_filter_repeat_limit: usize,
 ) -> PileupStats {
@@ -1565,16 +1807,36 @@ fn compute_pileup_counts(
     let mut stats = PileupStats {
         ref_dist_from_read_end: 0.0,
         alt_dist_from_read_end: 0.0,
+        ref_dist_from_read_end_r1: 0.0,
+        ref_dist_from_read_end_r2: 0.0,
+        alt_dist_from_read_end_r1: 0.0,
+        alt_dist_from_read_end_r2: 0.0,
         ref_insert_size_sum: 0.0,
         alt_insert_size_sum: 0.0,
         total_alt_counts: 0.0,
         total_ref_counts: 0.0,
+        total_alt_counts_r1: 0.0,
+        total_alt_counts_r2: 0.0,
+        total_ref_counts_r1: 0.0,
+        total_ref_counts_r2: 0.0,
         count_ref_mapq: 0.0,
         count_alt_mapq: 0.0,
+        count_ref_mapq_r1: 0.0,
+        count_ref_mapq_r2: 0.0,
+        count_alt_mapq_r1: 0.0,
+        count_alt_mapq_r2: 0.0,
         count_ref_bq: 0.0,
         count_alt_bq: 0.0,
+        count_ref_bq_r1: 0.0,
+        count_ref_bq_r2: 0.0,
+        count_alt_bq_r1: 0.0,
+        count_alt_bq_r2: 0.0,
         total_mismatches: 0.0,
+        total_mismatches_r1: 0.0,
+        total_mismatches_r2: 0.0,
         total_read_length: 0.0,
+        total_read_length_r1: 0.0,
+        total_read_length_r2: 0.0,
         read_end_filtered_count_indels: 0.0,
         indel_offset: 0,
     };
@@ -1607,6 +1869,12 @@ fn compute_pileup_counts(
         let mapq = record.mapq();
         let basecall = BaseCall::new(&alignment, ref_seq, ref_pos);
         let variant_type = basecall.check_variant_type();
+        let read_number = read_number_of(&record, sequencing_mode);
+
+        match read_number {
+            ReadNumber::R1 => stats.total_mismatches_r1 += mismatches as f64,
+            ReadNumber::R2 => stats.total_mismatches_r2 += mismatches as f64,
+        }
 
         if qual < min_bq as u8 || mapq < min_mapq as u8 {
             continue;
@@ -1615,17 +1883,49 @@ fn compute_pileup_counts(
         let is_ref = variant_type == VariantObservation::Ref;
         if is_ref {
             stats.total_ref_counts += 1.0;
+            match read_number {
+                ReadNumber::R1 => stats.total_ref_counts_r1 += 1.0,
+                ReadNumber::R2 => stats.total_ref_counts_r2 += 1.0,
+            }
             stats.count_ref_mapq += mapq as f64;
+            match read_number {
+                ReadNumber::R1 => stats.count_ref_mapq_r1 += mapq as f64,
+                ReadNumber::R2 => stats.count_ref_mapq_r2 += mapq as f64,
+            }
             stats.count_ref_bq += qual as f64;
-            stats.ref_dist_from_read_end +=
-                std::cmp::min(qpos, record.seq().len() - 1 - qpos) as f64;
+            match read_number {
+                ReadNumber::R1 => stats.count_ref_bq_r1 += qual as f64,
+                ReadNumber::R2 => stats.count_ref_bq_r2 += qual as f64,
+            }
+            let dist = std::cmp::min(qpos, record.seq().len() - 1 - qpos) as f64;
+            stats.ref_dist_from_read_end += dist;
+            match read_number {
+                ReadNumber::R1 => stats.ref_dist_from_read_end_r1 += dist,
+                ReadNumber::R2 => stats.ref_dist_from_read_end_r2 += dist,
+            }
             stats.ref_insert_size_sum += record.insert_size().unsigned_abs() as f64;
         } else {
             stats.total_alt_counts += 1.0;
+            match read_number {
+                ReadNumber::R1 => stats.total_alt_counts_r1 += 1.0,
+                ReadNumber::R2 => stats.total_alt_counts_r2 += 1.0,
+            }
             stats.count_alt_mapq += mapq as f64;
+            match read_number {
+                ReadNumber::R1 => stats.count_alt_mapq_r1 += mapq as f64,
+                ReadNumber::R2 => stats.count_alt_mapq_r2 += mapq as f64,
+            }
             stats.count_alt_bq += qual as f64;
-            stats.alt_dist_from_read_end +=
-                std::cmp::min(qpos, record.seq().len() - 1 - qpos) as f64;
+            match read_number {
+                ReadNumber::R1 => stats.count_alt_bq_r1 += qual as f64,
+                ReadNumber::R2 => stats.count_alt_bq_r2 += qual as f64,
+            }
+            let dist = std::cmp::min(qpos, record.seq().len() - 1 - qpos) as f64;
+            stats.alt_dist_from_read_end += dist;
+            match read_number {
+                ReadNumber::R1 => stats.alt_dist_from_read_end_r1 += dist,
+                ReadNumber::R2 => stats.alt_dist_from_read_end_r2 += dist,
+            }
             stats.alt_insert_size_sum += record.insert_size().unsigned_abs() as f64;
         }
 
@@ -1634,6 +1934,10 @@ fn compute_pileup_counts(
         }
 
         stats.total_read_length += record.seq().len() as f64;
+        match read_number {
+            ReadNumber::R1 => stats.total_read_length_r1 += record.seq().len() as f64,
+            ReadNumber::R2 => stats.total_read_length_r2 += record.seq().len() as f64,
+        }
 
         let read_len = record.seq().len();
         match variant_type {
@@ -1651,8 +1955,8 @@ fn compute_pileup_counts(
         }
 
         // Strand assignment.
-        let on_rev = (record.is_reverse() && is_stranded_read(&record, stranded_read))
-            || (!record.is_reverse() && !is_stranded_read(&record, stranded_read));
+        let on_rev = (record.is_reverse() && is_stranded_read(&record, stranded_read, sequencing_mode))
+            || (!record.is_reverse() && !is_stranded_read(&record, stranded_read, sequencing_mode));
 
         if on_rev {
             *pileup_counts.rev.entry(basecall.clone()).or_insert(0) += 1;
@@ -1727,7 +2031,7 @@ fn call_all_chunks(
         chunks
             .par_iter()
             .map(|chunk| {
-                let variants = call_variants(
+                let variants = call_variants_impl(
                     chunk,
                     bam_path,
                     ref_seqs
@@ -1742,6 +2046,7 @@ fn call_all_chunks(
                     args.min_ao,
                     args.error_rate,
                     &args.stranded_read,
+                    &args.sequencing_mode,
                     args.indel_filter_repeat_limit,
                     &args.model_path,
                     ml_threshold,
@@ -1847,10 +2152,10 @@ fn workflow(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Write to VCF
     let mut vcf_file = File::create(&args.output_vcf)?;
     let header = bam::Reader::from_path(tumor_bam_path)?.header().to_owned();
-    vcf_file.write_all(get_vcf_header(&header).as_bytes())?;
+    vcf_file.write_all(get_vcf_header_for_mode(&header, &args.sequencing_mode).as_bytes())?;
 
     for variant in all_variants {
-        vcf_file.write_all(variant.to_vcf().as_bytes())?;
+        vcf_file.write_all(variant.to_vcf_for_mode(&args.sequencing_mode).as_bytes())?;
     }
 
     Ok(())
@@ -1889,6 +2194,7 @@ fn compute_tnc_error_rates(
     max_mismatches: u32,
     error_rate: f64,
     stranded_read: &ReadNumber,
+    sequencing_mode: &SequencingMode,
     indel_filter_repeat_limit: usize,
 ) -> Result<HashMap<TrinucleotideContext, f64>, Box<dyn std::error::Error>> {
     // Pre-populate every possible TNC with zero counts.
@@ -1927,7 +2233,7 @@ fn compute_tnc_error_rates(
 
         compute_pileup_counts(
             &pileup, min_bq, min_mapq, end_of_read_cutoff, indel_end_of_read_cutoff,
-            max_mismatches, ref_seq, pos, stranded_read, &mut pileup_counts,
+            max_mismatches, ref_seq, pos, stranded_read, sequencing_mode, &mut pileup_counts,
             indel_filter_repeat_limit,
         );
 
@@ -2087,6 +2393,7 @@ fn emit_variants(
     min_depth: u32,
     ml_threshold: f64,
     model_config: &ModelInferenceConfig,
+    stranded_read: &ReadNumber,
 ) {
     if class.candidates.is_empty() || class.depth < min_depth as u64 {
         return;
@@ -2114,12 +2421,36 @@ fn emit_variants(
         let ref_forward_count = *class.fwd_counts.get(&ref_call).unwrap_or(&0) as u32;
         let ref_reverse_count = *class.rev_counts.get(&ref_call).unwrap_or(&0) as u32;
 
+        let (alt_forward_count_r1, alt_forward_count_r2, alt_reverse_count_r1, alt_reverse_count_r2,
+            ref_forward_count_r1, ref_forward_count_r2, ref_reverse_count_r1, ref_reverse_count_r2) =
+            match stranded_read {
+                ReadNumber::R1 => (
+                    alt_forward_count,
+                    0,
+                    alt_reverse_count,
+                    0,
+                    ref_forward_count,
+                    0,
+                    ref_reverse_count,
+                    0,
+                ),
+                ReadNumber::R2 => (
+                    0,
+                    alt_forward_count,
+                    0,
+                    alt_reverse_count,
+                    0,
+                    ref_forward_count,
+                    0,
+                    ref_reverse_count,
+                ),
+            };
+
         let mut variant = Variant {
             contig: site.contig.to_string(),
             pos: site.pos + 1,
             reference: candidate.get_reference_allele(),
             alt: candidate.get_alternate_allele(),
-            // Genotype is assigned only after the call passes the ML filter.
             genotype: String::new(),
             score: 0.0,
             depth: rules.reported_depth as u32,
@@ -2130,10 +2461,22 @@ fn emit_variants(
             probability: class.probability,
             average_ref_mapq: site.avg.ref_mapq,
             average_alt_mapq: site.avg.alt_mapq,
+            average_ref_mapq_r1: site.avg.ref_mapq_r1,
+            average_ref_mapq_r2: site.avg.ref_mapq_r2,
+            average_alt_mapq_r1: site.avg.alt_mapq_r1,
+            average_alt_mapq_r2: site.avg.alt_mapq_r2,
             average_ref_bq: site.avg.ref_bq,
             average_alt_bq: site.avg.alt_bq,
+            average_ref_bq_r1: site.avg.ref_bq_r1,
+            average_ref_bq_r2: site.avg.ref_bq_r2,
+            average_alt_bq_r1: site.avg.alt_bq_r1,
+            average_alt_bq_r2: site.avg.alt_bq_r2,
             avg_ref_dist_from_read_end: site.avg.ref_dist,
             avg_alt_dist_from_read_end: site.avg.alt_dist,
+            avg_ref_dist_from_read_end_r1: site.avg.ref_dist_r1,
+            avg_ref_dist_from_read_end_r2: site.avg.ref_dist_r2,
+            avg_alt_dist_from_read_end_r1: site.avg.alt_dist_r1,
+            avg_alt_dist_from_read_end_r2: site.avg.alt_dist_r2,
             avg_ref_insert_size: site.avg.ref_ins,
             avg_alt_insert_size: site.avg.alt_ins,
             fwd_probability: class.fwd_probability,
@@ -2141,11 +2484,23 @@ fn emit_variants(
             large_local_entropy: site.large_entropy,
             small_local_entropy: site.small_entropy,
             avg_mismatch_per_read: site.avg.mismatch,
+            avg_mismatch_per_read_r1: site.avg.mismatch_r1,
+            avg_mismatch_per_read_r2: site.avg.mismatch_r2,
             avg_read_length: site.avg.read_length,
+            avg_read_length_r1: site.avg.read_length_r1,
+            avg_read_length_r2: site.avg.read_length_r2,
             alt_forward_count,
+            alt_forward_count_r1,
+            alt_forward_count_r2,
             alt_reverse_count,
+            alt_reverse_count_r1,
+            alt_reverse_count_r2,
             ref_forward_count,
+            ref_forward_count_r1,
+            ref_forward_count_r2,
             ref_reverse_count,
+            ref_reverse_count_r1,
+            ref_reverse_count_r2,
             model_probability: 0.0,
             strand_bias: 0.0,
         };
@@ -2184,7 +2539,7 @@ fn emit_variants(
 ///
 /// # Returns
 /// A vector of Variant instances
-fn call_variants(
+fn call_variants_impl(
     chunk: &GenomeChunk,
     bam_path: &str,
     ref_seq: &[u8],
@@ -2197,6 +2552,7 @@ fn call_variants(
     min_ao: u32,
     error_rate: f64,
     stranded_read: &ReadNumber,
+    sequencing_mode: &SequencingMode,
     indel_filter_repeat_limit: usize,
     model_path: &str,
     ml_threshold: f64,
@@ -2206,7 +2562,7 @@ fn call_variants(
     let error_map = compute_tnc_error_rates(
         chunk, bam_path, ref_seq, min_bq, min_mapq, min_depth,
         end_of_read_cutoff, indel_end_of_read_cutoff, max_mismatches,
-        error_rate, stranded_read, indel_filter_repeat_limit,
+        error_rate, stranded_read, sequencing_mode, indel_filter_repeat_limit,
     )?;
 
     let mut bam = bam::IndexedReader::from_path(bam_path)?;
@@ -2232,7 +2588,7 @@ fn call_variants(
 
         let s = compute_pileup_counts(
             &pileup, min_bq, min_mapq, end_of_read_cutoff, indel_end_of_read_cutoff,
-            max_mismatches, ref_seq, pos, stranded_read, &mut pileup_counts,
+            max_mismatches, ref_seq, pos, stranded_read, sequencing_mode, &mut pileup_counts,
             indel_filter_repeat_limit,
         );
 
@@ -2276,11 +2632,48 @@ fn call_variants(
             directive_override: Some(CallingDirective::BothStrands),
         };
 
-        emit_variants(&mut variants, &site, snps, &snp_rules, min_depth, ml_threshold, model_config);
-        emit_variants(&mut variants, &site, indels, &indel_rules, min_depth, ml_threshold, model_config);
+        emit_variants(&mut variants, &site, snps, &snp_rules, min_depth, ml_threshold, model_config, stranded_read);
+        emit_variants(&mut variants, &site, indels, &indel_rules, min_depth, ml_threshold, model_config, stranded_read);
     }
 
     Ok(variants)
+}
+
+fn call_variants(
+    chunk: &GenomeChunk,
+    bam_path: &str,
+    ref_seq: &[u8],
+    min_bq: usize,
+    min_mapq: usize,
+    min_depth: u32,
+    end_of_read_cutoff: usize,
+    indel_end_of_read_cutoff: usize,
+    max_mismatches: u32,
+    min_ao: u32,
+    error_rate: f64,
+    stranded_read: &ReadNumber,
+    indel_filter_repeat_limit: usize,
+    model_path: &str,
+    ml_threshold: f64,
+) -> Result<Vec<Variant>, Box<dyn std::error::Error>> {
+    call_variants_impl(
+        chunk,
+        bam_path,
+        ref_seq,
+        min_bq,
+        min_mapq,
+        min_depth,
+        end_of_read_cutoff,
+        indel_end_of_read_cutoff,
+        max_mismatches,
+        min_ao,
+        error_rate,
+        stranded_read,
+        &SequencingMode::PairedEnd,
+        indel_filter_repeat_limit,
+        model_path,
+        ml_threshold,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2515,10 +2908,22 @@ mod tests {
             probability: 0.9,
             average_ref_mapq: 30.0,
             average_alt_mapq: 31.0,
+            average_ref_mapq_r1: 30.1,
+            average_ref_mapq_r2: 29.9,
+            average_alt_mapq_r1: 31.1,
+            average_alt_mapq_r2: 30.9,
             average_ref_bq: 32.0,
             average_alt_bq: 33.0,
+            average_ref_bq_r1: 32.1,
+            average_ref_bq_r2: 31.9,
+            average_alt_bq_r1: 33.1,
+            average_alt_bq_r2: 32.9,
             avg_ref_dist_from_read_end: 5.0,
             avg_alt_dist_from_read_end: 6.0,
+            avg_ref_dist_from_read_end_r1: 5.1,
+            avg_ref_dist_from_read_end_r2: 4.9,
+            avg_alt_dist_from_read_end_r1: 6.1,
+            avg_alt_dist_from_read_end_r2: 5.9,
             avg_ref_insert_size: 200.0,
             avg_alt_insert_size: 201.0,
             fwd_probability: 0.8,
@@ -2526,11 +2931,23 @@ mod tests {
             large_local_entropy: 1.1,
             small_local_entropy: 0.9,
             avg_mismatch_per_read: 0.2,
+            avg_mismatch_per_read_r1: 0.21,
+            avg_mismatch_per_read_r2: 0.19,
             avg_read_length: 150.0,
+            avg_read_length_r1: 151.0,
+            avg_read_length_r2: 149.0,
             alt_forward_count: 2,
+            alt_forward_count_r1: 1,
+            alt_forward_count_r2: 1,
             alt_reverse_count: 2,
+            alt_reverse_count_r1: 1,
+            alt_reverse_count_r2: 1,
             ref_forward_count: 3,
+            ref_forward_count_r1: 2,
+            ref_forward_count_r2: 1,
             ref_reverse_count: 3,
+            ref_reverse_count_r1: 1,
+            ref_reverse_count_r2: 2,
             model_probability: 0.95,
             strand_bias: 0.5,
         };
@@ -2564,10 +2981,22 @@ mod tests {
             probability: 0.9,
             average_ref_mapq: 30.0,
             average_alt_mapq: 31.0,
+            average_ref_mapq_r1: 30.1,
+            average_ref_mapq_r2: 29.9,
+            average_alt_mapq_r1: 31.1,
+            average_alt_mapq_r2: 30.9,
             average_ref_bq: 32.0,
             average_alt_bq: 33.0,
+            average_ref_bq_r1: 32.1,
+            average_ref_bq_r2: 31.9,
+            average_alt_bq_r1: 33.1,
+            average_alt_bq_r2: 32.9,
             avg_ref_dist_from_read_end: 5.0,
             avg_alt_dist_from_read_end: 6.0,
+            avg_ref_dist_from_read_end_r1: 5.1,
+            avg_ref_dist_from_read_end_r2: 4.9,
+            avg_alt_dist_from_read_end_r1: 6.1,
+            avg_alt_dist_from_read_end_r2: 5.9,
             avg_ref_insert_size: 200.0,
             avg_alt_insert_size: 201.0,
             fwd_probability: 0.8,
@@ -2575,11 +3004,23 @@ mod tests {
             large_local_entropy: 1.1,
             small_local_entropy: 0.9,
             avg_mismatch_per_read: 0.2,
+            avg_mismatch_per_read_r1: 0.21,
+            avg_mismatch_per_read_r2: 0.19,
             avg_read_length: 150.0,
+            avg_read_length_r1: 151.0,
+            avg_read_length_r2: 149.0,
             alt_forward_count: 2,
+            alt_forward_count_r1: 1,
+            alt_forward_count_r2: 1,
             alt_reverse_count: 1,
+            alt_reverse_count_r1: 1,
+            alt_reverse_count_r2: 0,
             ref_forward_count: 7,
+            ref_forward_count_r1: 4,
+            ref_forward_count_r2: 3,
             ref_reverse_count: 5,
+            ref_reverse_count_r1: 2,
+            ref_reverse_count_r2: 3,
             model_probability: 0.95,
             strand_bias: 0.5,
         };
@@ -2588,12 +3029,19 @@ mod tests {
         let fields: Vec<_> = record.trim_end().split('\t').collect();
         let format_keys: Vec<_> = fields[8].split(':').collect();
         let sample_values: Vec<_> = fields[9].split(':').collect();
+        let format_map = format_keys
+            .iter()
+            .zip(sample_values.iter())
+            .map(|(key, value)| (*key, *value))
+            .collect::<std::collections::HashMap<_, _>>();
 
         assert_eq!(format_keys.len(), sample_values.len(), "FORMAT/value column count mismatch: {record}");
         assert!(!format_keys.contains(&"MFC"), "dead FORMAT key should not be emitted: {record}");
-        assert_eq!(sample_values[20], "2", "FWD should be alt-supporting forward reads");
-        assert_eq!(sample_values[21], "1", "REV should be alt-supporting reverse reads");
-        assert_eq!(sample_values[22], "3", "TOT should be total alt-supporting reads");
+        assert_eq!(format_map[&"FWD"], "2", "FWD should be alt-supporting forward reads");
+        assert_eq!(format_map[&"REV"], "1", "REV should be alt-supporting reverse reads");
+        assert_eq!(format_map[&"TOT"], "3", "TOT should be total alt-supporting reads");
+        assert_eq!(format_map[&"FWD_R1"], "1", "FWD_R1 should count alt-supporting forward R1 reads");
+        assert_eq!(format_map[&"REV_R2"], "0", "REV_R2 should count alt-supporting reverse R2 reads");
     }
 
     #[test]
@@ -2609,7 +3057,89 @@ mod tests {
         assert!(vcf_header.contains("Aggregate right-tail binomial evidence score"));
         assert!(vcf_header.contains("Fraction of strand-separated aggregate evidence contributed by forward reads"));
         assert!(vcf_header.contains("Total alternate-supporting read count across both strands"));
+        assert!(vcf_header.contains("##FORMAT=<ID=FWD_R1,Number=1,Type=Float"));
+        assert!(vcf_header.contains("##FORMAT=<ID=REDR_R2,Number=1,Type=Float"));
         assert!(!vcf_header.contains("##FORMAT=<ID=MFC,"));
+    }
+
+    #[test]
+    fn single_end_vcf_omits_mate_specific_format_fields() {
+        let variant = Variant {
+            contig: "chr1".to_string(),
+            pos: 1,
+            reference: "T".to_string(),
+            alt: "C".to_string(),
+            genotype: "0/1".to_string(),
+            score: 42.0,
+            depth: 10,
+            alt_counts: 4,
+            calling_directive: CallingDirective::BothStrands,
+            error_rate: 0.001,
+            tnc: TrinucleotideContext::new(b'A', b'T', b'G'),
+            probability: 0.9,
+            average_ref_mapq: 30.0,
+            average_alt_mapq: 31.0,
+            average_ref_mapq_r1: 30.1,
+            average_ref_mapq_r2: 29.9,
+            average_alt_mapq_r1: 31.1,
+            average_alt_mapq_r2: 30.9,
+            average_ref_bq: 32.0,
+            average_alt_bq: 33.0,
+            average_ref_bq_r1: 32.1,
+            average_ref_bq_r2: 31.9,
+            average_alt_bq_r1: 33.1,
+            average_alt_bq_r2: 32.9,
+            avg_ref_dist_from_read_end: 5.0,
+            avg_alt_dist_from_read_end: 6.0,
+            avg_ref_dist_from_read_end_r1: 5.1,
+            avg_ref_dist_from_read_end_r2: 4.9,
+            avg_alt_dist_from_read_end_r1: 6.1,
+            avg_alt_dist_from_read_end_r2: 5.9,
+            avg_ref_insert_size: 200.0,
+            avg_alt_insert_size: 201.0,
+            fwd_probability: 0.8,
+            rev_probability: 0.2,
+            large_local_entropy: 1.1,
+            small_local_entropy: 0.9,
+            avg_mismatch_per_read: 0.2,
+            avg_mismatch_per_read_r1: 0.21,
+            avg_mismatch_per_read_r2: 0.19,
+            avg_read_length: 150.0,
+            avg_read_length_r1: 151.0,
+            avg_read_length_r2: 149.0,
+            alt_forward_count: 2,
+            alt_forward_count_r1: 2,
+            alt_forward_count_r2: 0,
+            alt_reverse_count: 1,
+            alt_reverse_count_r1: 1,
+            alt_reverse_count_r2: 0,
+            ref_forward_count: 7,
+            ref_forward_count_r1: 7,
+            ref_forward_count_r2: 0,
+            ref_reverse_count: 5,
+            ref_reverse_count_r1: 5,
+            ref_reverse_count_r2: 0,
+            model_probability: 0.95,
+            strand_bias: 0.5,
+        };
+
+        let record = variant.to_vcf_for_mode(&SequencingMode::SingleEnd);
+        let fields: Vec<_> = record.trim_end().split('\t').collect();
+        let format_keys: Vec<_> = fields[8].split(':').collect();
+
+        assert!(!format_keys.iter().any(|key| key.ends_with("_R1") || key.ends_with("_R2")));
+        assert!(!record.contains("FWD_R1"));
+
+        let bam = bam::Reader::from_path(
+            "test_assets/testing_bams/denovo_ot_chr11_134749303_A_G_het.bam",
+        )
+        .expect("Failed to open BAM");
+        let header = bam.header().to_owned();
+        let vcf_header = get_vcf_header_for_mode(&header, &SequencingMode::SingleEnd);
+
+        assert!(!vcf_header.contains("##FORMAT=<ID=FWD_R1,"));
+        assert!(!vcf_header.contains("##FORMAT=<ID=AMQR_R2,"));
+        assert!(vcf_header.contains("##FORMAT=<ID=FWD,Number=1,Type=Float"));
     }
 
     fn load_ref_seq(contig: &str) -> Vec<u8> {
