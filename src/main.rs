@@ -29,7 +29,7 @@ use tracing::warn;
 use ort::{session::Session as OrtSession, value::TensorRef};
 
 #[cfg(feature = "onnx-inference")]
-// NOTE: per thread storage of ONNX models to avoid contention and allow for parallel inference
+
 thread_local! {
     static THREAD_LOCAL_ONNX_MODELS: RefCell<HashMap<String, Option<OrtSession>>> = RefCell::new(HashMap::new());
 }
@@ -47,13 +47,12 @@ const MODEL_VT_VALUES: [&str; 5] = ["COMPLEX", "DEL", "INS", "MNP", "SNP"];
 #[cfg(feature = "onnx-inference")]
 const BASE_FEATURE_NAMES: &[&str] = &[
     "DP", "AO", "ER", "PR",
-    "MFR", "MFA", "BFR", "BFA",
     "AMQR", "AMQA", "ABQR", "ABQA",
     "REDR", "REDA", "ISR", "ISA",
     "FWDP", "REVP", "LLE", "SLE",
-    "REFC", "AMPR", "MFC", "ARL",
+    "AMPR", "ARL",
     "FWD", "REV", "TOT",
-    "AF", "MQ_diff", "BQ_diff", "RED_diff", "IS_diff", "strand_bias",
+    "AF", "strand_bias",
 ];
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
@@ -172,10 +171,6 @@ struct Variant {
     error_rate: f64,
     tnc: TrinucleotideContext,
     probability: f64,
-    mapq_filtered_ref: f64,
-    mapq_filtered_alt: f64,
-    bq_filtered_ref: f64,
-    bq_filtered_alt: f64,
     average_ref_mapq: f64,
     average_alt_mapq: f64,
     average_ref_bq: f64,
@@ -188,14 +183,14 @@ struct Variant {
     rev_probability: f64,
     large_local_entropy: f64,
     small_local_entropy: f64,
-    read_end_filtered_count: f64,
     avg_mismatch_per_read: f64,
-    mismatch_filtered_count: f64,
     avg_read_length: f64,
-    forward_strand_count_snps: f64,
-    reverse_strand_count_snps: f64,
-    both_strands_count_snps: f64,
+    alt_forward_count: u32,
+    alt_reverse_count: u32,
+    ref_forward_count: u32,
+    ref_reverse_count: u32,
     model_probability: f64,
+    strand_bias: f64,
 }
 
 impl Variant {
@@ -214,6 +209,26 @@ impl Variant {
             _ => "COMPLEX",
         }
     }
+
+    fn tnc_display(&self) -> String {
+        if self.infer_variant_type() == "SNP" {
+            format!(
+                "{}({}>{}){}",
+                self.tnc.upstream_base as char,
+                self.tnc.ref_base as char,
+                self.alt.as_bytes()[0] as char,
+                self.tnc.downstream_base as char,
+            )
+        } else {
+            format!(
+                "{}{}{}",
+                self.tnc.upstream_base as char,
+                self.tnc.ref_base as char,
+                self.tnc.downstream_base as char,
+            )
+        }
+    }
+
     /// Render this variant as a VCF record line (newline-terminated).
     fn to_vcf(&self) -> String {
         let cd = match self.calling_directive {
@@ -224,20 +239,21 @@ impl Variant {
             CallingDirective::BothStrands | CallingDirective::Indel => "BOTH",
         };
 
-        // Clamp zero probabilities to a small floor so downstream tools can
+        // Clamp zero evidence scores to a small floor so downstream tools can
         // take log without hitting -inf.
         let prob = self.probability.max(1e-300);
         let fwd_prob = self.fwd_probability.max(1e-300);
         let rev_prob = self.rev_probability.max(1e-300);
+        let alt_total = self.alt_forward_count + self.alt_reverse_count;
 
         format!(
             "{chrom}\t{pos}\t.\t{ref}\t{alt}\t{qual}\t.\tVT={vt};CD={cd};LRP={lrp:.4}\t\
-GT:DP:AO:ER:TNC:PR:MFR:MFA:BFR:BFA:AMQR:AMQA:ABQR:ABQA:REDR:REDA:ISR:ISA:\
-FWDP:REVP:LLE:SLE:REFC:AMPR:MFC:ARL:FWD:REV:TOT\t\
-{gt}:{dp}:{ao}:{er:.3E}:{up}{rb}{dn}:{pr:.3E}:{mfr:.1}:{mfa:.1}:{bfr:.1}:{bfa:.1}:\
+GT:DP:AO:ER:TNC:PR:AMQR:AMQA:ABQR:ABQA:REDR:REDA:ISR:ISA:\
+    FWDP:REVP:LLE:SLE:AMPR:ARL:FWD:REV:TOT:STB\t\
+{gt}:{dp}:{ao}:{er:.3E}:{tnc}:{pr:.3E}:\
 {amqr:.1}:{amqa:.1}:{abqr:.1}:{abqa:.1}:{redr:.1}:{reda:.1}:{isr:.1}:{isa:.1}:\
-{fwdp:.3E}:{revp:.3E}:{lle:.3}:{sle:.1}:{refc:.1}:{ampr:.1}:{mfc:.1}:{arl:.1}:\
-{fwd:.1}:{rev:.1}:{tot:.1}\n",
+{fwdp:.3E}:{revp:.3E}:{lle:.3}:{sle:.1}:{ampr:.1}:{arl:.1}:\
+{fwd:.1}:{rev:.1}:{tot:.1}:{stb:.3E}\n",
             chrom = self.contig,
             pos   = self.pos,
             ref   = self.reference,
@@ -250,14 +266,8 @@ FWDP:REVP:LLE:SLE:REFC:AMPR:MFC:ARL:FWD:REV:TOT\t\
             dp    = self.depth,
             ao    = self.alt_counts,
             er    = self.error_rate,
-            up    = self.tnc.upstream_base as char,
-            rb    = self.tnc.ref_base as char,
-            dn    = self.tnc.downstream_base as char,
+            tnc   = self.tnc_display(),
             pr    = prob,
-            mfr   = self.mapq_filtered_ref,
-            mfa   = self.mapq_filtered_alt,
-            bfr   = self.bq_filtered_ref,
-            bfa   = self.bq_filtered_alt,
             amqr  = self.average_ref_mapq,
             amqa  = self.average_alt_mapq,
             abqr  = self.average_ref_bq,
@@ -270,13 +280,12 @@ FWDP:REVP:LLE:SLE:REFC:AMPR:MFC:ARL:FWD:REV:TOT\t\
             revp  = rev_prob,
             lle   = self.large_local_entropy,
             sle   = self.small_local_entropy,
-            refc  = self.read_end_filtered_count,
             ampr  = self.avg_mismatch_per_read,
-            mfc   = self.mismatch_filtered_count,
             arl   = self.avg_read_length,
-            fwd   = self.forward_strand_count_snps,
-            rev   = self.reverse_strand_count_snps,
-            tot   = self.both_strands_count_snps,
+            fwd   = self.alt_forward_count,
+            rev   = self.alt_reverse_count,
+            tot   = alt_total,
+            stb   = self.strand_bias,
         )
     }
 }
@@ -632,12 +641,8 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n\
 ##FORMAT=<ID=AO,Number=1,Type=Integer,Description=\"Alternate Allele Count\">\n\
 ##FORMAT=<ID=ER,Number=1,Type=Float,Description=\"Estimated Error Rate\">\n\
-##FORMAT=<ID=TNC,Number=3,Type=String,Description=\"Trinucleotide Context (upstream,ref,downstream)\">\n\
-##FORMAT=<ID=PR,Number=1,Type=Float,Description=\"Probability of the called genotype\">\n\
-##FORMAT=<ID=MFR,Number=1,Type=Float,Description=\"Count of reference-supporting reads filtered by mapping quality\">\n\
-##FORMAT=<ID=MFA,Number=1,Type=Float,Description=\"Count of alternate-supporting reads filtered by mapping quality\">\n\
-##FORMAT=<ID=BFR,Number=1,Type=Float,Description=\"Count of reference-supporting reads filtered by base quality\">\n\
-##FORMAT=<ID=BFA,Number=1,Type=Float,Description=\"Count of alternate-supporting reads filtered by base quality\">\n\
+##FORMAT=<ID=TNC,Number=1,Type=String,Description=\"Trinucleotide Context (SNPs: up(ref>alt)down; non-SNPs: upstream,ref,downstream)\">\n\
+##FORMAT=<ID=PR,Number=1,Type=Float,Description=\"Aggregate right-tail binomial evidence score for the emitted call\">\n\
 ##FORMAT=<ID=AMQR,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the reference allele\">\n\
 ##FORMAT=<ID=AMQA,Number=1,Type=Float,Description=\"Average mapping quality of reads supporting the alternate allele\">\n\
 ##FORMAT=<ID=ABQR,Number=1,Type=Float,Description=\"Average base quality of reads supporting the reference allele\">\n\
@@ -646,17 +651,16 @@ fn get_vcf_header(header: &bam::HeaderView) -> String {
 ##FORMAT=<ID=REDA,Number=1,Type=Float,Description=\"Average distance from read end for reads supporting the alternate allele\">\n\
 ##FORMAT=<ID=ISR,Number=1,Type=Float,Description=\"Average insert size for reads supporting the reference allele\">\n\
 ##FORMAT=<ID=ISA,Number=1,Type=Float,Description=\"Average insert size for reads supporting the alternate allele\">\n\
-##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Probability of the called genotype based on forward strand reads only\">\n\
-##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Probability of the called genotype based on reverse strand reads only\">\n\
+##FORMAT=<ID=FWDP,Number=1,Type=Float,Description=\"Fraction of strand-separated aggregate evidence contributed by forward reads\">\n\
+##FORMAT=<ID=REVP,Number=1,Type=Float,Description=\"Fraction of strand-separated aggregate evidence contributed by reverse reads\">\n\
 ##FORMAT=<ID=LLE,Number=1,Type=Float,Description=\"Large local sequence entropy (50 bp on either side)\">\n\
 ##FORMAT=<ID=SLE,Number=1,Type=Float,Description=\"Small local sequence entropy (15 bp on either side)\">\n\
-##FORMAT=<ID=REFC,Number=1,Type=Float,Description=\"Count of reads filtered due to proximity to read ends\">\n\
 ##FORMAT=<ID=AMPR,Number=1,Type=Float,Description=\"Average mismatches per read at the position\">\n\
-##FORMAT=<ID=MFC,Number=1,Type=Float,Description=\"Count of reads filtered due to mismatches at the position\">\n\
 ##FORMAT=<ID=ARL,Number=1,Type=Float,Description=\"Average read length of reads covering the position\">\n\
-##FORMAT=<ID=FWD,Number=1,Type=Float,Description=\"Forward counts\">\n\
-##FORMAT=<ID=REV,Number=1,Type=Float,Description=\"Reverse counts\">\n\
-##FORMAT=<ID=TOT,Number=1,Type=Float,Description=\"Both strand counts\">\n\
+##FORMAT=<ID=FWD,Number=1,Type=Float,Description=\"Alternate-supporting forward-strand read count\">\n\
+##FORMAT=<ID=REV,Number=1,Type=Float,Description=\"Alternate-supporting reverse-strand read count\">\n\
+##FORMAT=<ID=TOT,Number=1,Type=Float,Description=\"Total alternate-supporting read count across both strands\">\n\
+##FORMAT=<ID=STB,Number=1,Type=Float,Description=\"Fisher exact strand-bias p-value for reference versus alternate support\">\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n",
         contigs
     )
@@ -676,6 +680,58 @@ fn right_tail_binomial_pval(n: u64, k: u64, p: f64) -> f64 {
     let cdf = binom.cdf(k - 1);
     1.0 - cdf
 }
+
+fn log_binom(n: u64, k: u64) -> f64 {
+    let k = k.min(n.saturating_sub(k));
+    let mut result = 0.0;
+    for i in 1..=k {
+        result += ((n - k + i) as f64).ln() - (i as f64).ln();
+    }
+    result
+}
+
+fn fisher_exact_test(a: u64, b: u64, c: u64, d: u64) -> f64 {
+    let row1 = a + b;
+    let row2 = c + d;
+    let col1 = a + c;
+    let total = row1 + row2;
+
+    if total == 0 || row1 == 0 || row2 == 0 || col1 == 0 || total < col1 {
+        return 1.0;
+    }
+
+    let observed = (log_binom(row1, a) + log_binom(row2, c) - log_binom(total, col1)).exp();
+    let x_min = col1.saturating_sub(row2).max(0);
+    let x_max = row1.min(col1);
+
+    let mut p_value = 0.0;
+    for x in x_min..=x_max {
+        let y = col1 - x;
+        if x > row1 || y > row2 {
+            continue;
+        }
+        let prob = (log_binom(row1, x) + log_binom(row2, y) - log_binom(total, col1)).exp();
+        if prob <= observed + 1e-12 {
+            p_value += prob;
+        }
+    }
+
+    p_value.min(1.0).max(0.0)
+}
+
+fn strand_bias_fisher_pvalue(variant: &Variant) -> f64 {
+    let alt_fwd = variant.alt_forward_count as u64;
+    let alt_rev = variant.alt_reverse_count as u64;
+    let ref_fwd = variant.ref_forward_count as u64;
+    let ref_rev = variant.ref_reverse_count as u64;
+
+    if alt_fwd + alt_rev == 0 {
+        return 1.0;
+    }
+
+    fisher_exact_test(alt_fwd, ref_fwd, alt_rev, ref_rev)
+}
+
 fn get_count_vec_candidates(
     counts: &HashMap<BaseCall, usize>,
     error_rate: f64,
@@ -837,21 +893,13 @@ fn build_model_feature_map(v: &Variant) -> HashMap<String, f64> {
     let depth = v.depth as f64;
     let alt_counts = v.alt_counts as f64;
     let af = if depth > 0.0 { alt_counts / depth } else { 0.0 };
-    let mq_diff = v.average_alt_mapq - v.average_ref_mapq;
-    let bq_diff = v.average_alt_bq - v.average_ref_bq;
-    let red_diff = v.avg_alt_dist_from_read_end - v.avg_ref_dist_from_read_end;
-    let is_diff = v.avg_alt_insert_size - v.avg_ref_insert_size;
-    let strand_bias = (v.fwd_probability - v.rev_probability).abs();
+    let strand_bias = strand_bias_fisher_pvalue(v);
 
     let mut values = HashMap::<String, f64>::new();
     values.insert("DP".to_string(), depth);
     values.insert("AO".to_string(), alt_counts);
     values.insert("ER".to_string(), v.error_rate);
     values.insert("PR".to_string(), v.probability);
-    values.insert("MFR".to_string(), v.mapq_filtered_ref);
-    values.insert("MFA".to_string(), v.mapq_filtered_alt);
-    values.insert("BFR".to_string(), v.bq_filtered_ref);
-    values.insert("BFA".to_string(), v.bq_filtered_alt);
     values.insert("AMQR".to_string(), v.average_ref_mapq);
     values.insert("AMQA".to_string(), v.average_alt_mapq);
     values.insert("ABQR".to_string(), v.average_ref_bq);
@@ -864,18 +912,12 @@ fn build_model_feature_map(v: &Variant) -> HashMap<String, f64> {
     values.insert("REVP".to_string(), v.rev_probability);
     values.insert("LLE".to_string(), v.large_local_entropy);
     values.insert("SLE".to_string(), v.small_local_entropy);
-    values.insert("REFC".to_string(), v.read_end_filtered_count);
     values.insert("AMPR".to_string(), v.avg_mismatch_per_read);
-    values.insert("MFC".to_string(), v.mismatch_filtered_count);
     values.insert("ARL".to_string(), v.avg_read_length);
-    values.insert("FWD".to_string(), v.forward_strand_count_snps);
-    values.insert("REV".to_string(), v.reverse_strand_count_snps);
-    values.insert("TOT".to_string(), v.both_strands_count_snps);
+    values.insert("FWD".to_string(), v.alt_forward_count as f64);
+    values.insert("REV".to_string(), v.alt_reverse_count as f64);
+    values.insert("TOT".to_string(), (v.alt_forward_count + v.alt_reverse_count) as f64);
     values.insert("AF".to_string(), af);
-    values.insert("MQ_diff".to_string(), mq_diff);
-    values.insert("BQ_diff".to_string(), bq_diff);
-    values.insert("RED_diff".to_string(), red_diff);
-    values.insert("IS_diff".to_string(), is_diff);
     // REVIEW: change this to a fisher's exact test
     values.insert("strand_bias".to_string(), strand_bias);
 
@@ -1438,15 +1480,9 @@ struct PileupStats {
     count_alt_mapq: f64,
     count_ref_bq: f64,
     count_alt_bq: f64,
-    mapq_filtered_ref: f64,
-    mapq_filtered_alt: f64,
-    bq_filtered_ref: f64,
-    bq_filtered_alt: f64,
-    read_end_filtered_count_snps: f64,
-    read_end_filtered_count_indels: f64,
-    mismatch_filtered_count: f64,
     total_mismatches: f64,
     total_read_length: f64,
+    read_end_filtered_count_indels: f64,
     indel_offset: u64,
 }
 
@@ -1537,15 +1573,9 @@ fn compute_pileup_counts(
         count_alt_mapq: 0.0,
         count_ref_bq: 0.0,
         count_alt_bq: 0.0,
-        mapq_filtered_ref: 0.0,
-        mapq_filtered_alt: 0.0,
-        bq_filtered_ref: 0.0,
-        bq_filtered_alt: 0.0,
-        read_end_filtered_count_snps: 0.0,
-        read_end_filtered_count_indels: 0.0,
-        mismatch_filtered_count: 0.0,
         total_mismatches: 0.0,
         total_read_length: 0.0,
+        read_end_filtered_count_indels: 0.0,
         indel_offset: 0,
     };
 
@@ -1554,8 +1584,9 @@ fn compute_pileup_counts(
         let mismatches = get_nm_tag(&record);
 
         if mismatches > max_mismatches {
-            stats.mismatch_filtered_count += 1.0;
+            continue;
         }
+
         stats.total_mismatches += mismatches as f64;
 
         let qpos = match alignment.qpos() {
@@ -1577,21 +1608,7 @@ fn compute_pileup_counts(
         let basecall = BaseCall::new(&alignment, ref_seq, ref_pos);
         let variant_type = basecall.check_variant_type();
 
-        if qual < min_bq as u8 {
-            if variant_type == VariantObservation::Ref {
-                stats.bq_filtered_ref += 1.0;
-            } else {
-                stats.bq_filtered_alt += 1.0;
-            }
-            continue;
-        }
-
-        if mapq < min_mapq as u8 {
-            if variant_type == VariantObservation::Ref {
-                stats.mapq_filtered_ref += 1.0;
-            } else {
-                stats.mapq_filtered_alt += 1.0;
-            }
+        if qual < min_bq as u8 || mapq < min_mapq as u8 {
             continue;
         }
 
@@ -1622,7 +1639,7 @@ fn compute_pileup_counts(
         match variant_type {
             VariantObservation::Snp => {
                 if qpos < end_of_read_cutoff || qpos >= read_len - end_of_read_cutoff {
-                    stats.read_end_filtered_count_snps += 1.0;
+                    continue;
                 }
             }
             VariantObservation::Insertion | VariantObservation::Deletion => {
@@ -1981,7 +1998,6 @@ struct SiteContext<'a> {
     pos: u32,
     tnc: TrinucleotideContext,
     tnc_er: f64,
-    stats: &'a PileupStats,
     avg: SiteAverages,
     large_entropy: f64,
     small_entropy: f64,
@@ -1991,14 +2007,13 @@ struct SiteContext<'a> {
 struct ClassCalls {
     candidates: HashSet<BaseCall>,
     counts: HashMap<BaseCall, usize>,
+    fwd_counts: HashMap<BaseCall, usize>,
+    rev_counts: HashMap<BaseCall, usize>,
     /// Sum of `counts`.
     depth: u64,
     probability: f64,
     fwd_probability: f64,
     rev_probability: f64,
-    fwd_count: f64,
-    rev_count: f64,
-    total_count: f64,
     directive: CallingDirective,
 }
 
@@ -2006,7 +2021,6 @@ struct ClassCalls {
 struct ClassRules {
     /// Depth reported in the VCF and used for genotyping.
     reported_depth: u64,
-    read_end_filtered_count: f64,
     genotype_error_rate: f64,
     /// Minimum alternate observations required to emit a candidate.
     min_alt_obs: usize,
@@ -2055,12 +2069,11 @@ fn select_class_calls(
         depth: counts.values().sum::<usize>() as u64,
         candidates,
         counts,
+        fwd_counts: fwd.clone(),
+        rev_counts: rev.clone(),
         probability: probs.iter().sum::<f64>(),
         fwd_probability: fwd_prob_sum / combined,
         rev_probability: rev_prob_sum / combined,
-        fwd_count: fwd.values().sum::<usize>() as f64,
-        rev_count: rev.values().sum::<usize>() as f64,
-        total_count: total.values().sum::<usize>() as f64,
         directive,
     }
 }
@@ -2090,6 +2103,17 @@ fn emit_variants(
             continue;
         }
 
+        let ref_call = BaseCall {
+            base: candidate.ref_base,
+            ref_base: candidate.ref_base,
+            deleted_bases: Vec::new(),
+            insertion_bases: Vec::new(),
+        };
+        let alt_forward_count = *class.fwd_counts.get(candidate).unwrap_or(&0) as u32;
+        let alt_reverse_count = *class.rev_counts.get(candidate).unwrap_or(&0) as u32;
+        let ref_forward_count = *class.fwd_counts.get(&ref_call).unwrap_or(&0) as u32;
+        let ref_reverse_count = *class.rev_counts.get(&ref_call).unwrap_or(&0) as u32;
+
         let mut variant = Variant {
             contig: site.contig.to_string(),
             pos: site.pos + 1,
@@ -2104,10 +2128,6 @@ fn emit_variants(
             error_rate: site.tnc_er,
             tnc: site.tnc.clone(),
             probability: class.probability,
-            mapq_filtered_ref: site.stats.mapq_filtered_ref,
-            mapq_filtered_alt: site.stats.mapq_filtered_alt,
-            bq_filtered_ref: site.stats.bq_filtered_ref,
-            bq_filtered_alt: site.stats.bq_filtered_alt,
             average_ref_mapq: site.avg.ref_mapq,
             average_alt_mapq: site.avg.alt_mapq,
             average_ref_bq: site.avg.ref_bq,
@@ -2120,16 +2140,17 @@ fn emit_variants(
             rev_probability: class.rev_probability,
             large_local_entropy: site.large_entropy,
             small_local_entropy: site.small_entropy,
-            read_end_filtered_count: rules.read_end_filtered_count,
             avg_mismatch_per_read: site.avg.mismatch,
-            mismatch_filtered_count: site.stats.mismatch_filtered_count,
             avg_read_length: site.avg.read_length,
-            forward_strand_count_snps: class.fwd_count,
-            reverse_strand_count_snps: class.rev_count,
-            both_strands_count_snps: class.total_count,
+            alt_forward_count,
+            alt_reverse_count,
+            ref_forward_count,
+            ref_reverse_count,
             model_probability: 0.0,
+            strand_bias: 0.0,
         };
 
+        variant.strand_bias = strand_bias_fisher_pvalue(&variant);
         variant.model_probability = model_probability_score(model_config, &variant);
         if variant.model_probability < ml_threshold {
             continue;
@@ -2231,7 +2252,6 @@ fn call_variants(
             pos,
             tnc,
             tnc_er,
-            stats: &s,
             avg: s.averages(),
             large_entropy: flank_entropy(ref_seq, pos as usize, 50),
             small_entropy: flank_entropy(ref_seq, pos as usize, 15),
@@ -2245,14 +2265,12 @@ fn call_variants(
 
         let snp_rules = ClassRules {
             reported_depth: total_depth,
-            read_end_filtered_count: s.read_end_filtered_count_snps,
             genotype_error_rate: tnc_er,
             min_alt_obs: 0,
             directive_override: None,
         };
         let indel_rules = ClassRules {
             reported_depth: total_depth_filtered,
-            read_end_filtered_count: s.read_end_filtered_count_indels,
             genotype_error_rate: 0.05,
             min_alt_obs: min_ao as usize,
             directive_override: Some(CallingDirective::BothStrands),
@@ -2296,6 +2314,74 @@ mod tests {
         assert_eq!(
             parse_feature_order_from_metadata(r#"["DP","AO"]"#),
             Some(vec!["DP".to_string(), "AO".to_string()])
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "onnx-inference")]
+    fn onnx_model_returns_raw_probability_for_fixture() {
+        std::env::remove_var("TVC_SKIP_ORT_IN_TESTS");
+
+        let test_ref = "test_assets/chr11.fasta";
+        let test_bam = "test_assets/testing_bams/denovo_ot_chr11_134479860_A_G_homo.bam";
+        let contig = "chr11";
+        let pos = 134479860_u32;
+
+        let ref_reader = faidx::Reader::from_path(test_ref).expect("Failed to open FASTA");
+        let seq_len = ref_reader.fetch_seq_len(contig);
+        let ref_seq: Vec<u8> = ref_reader
+            .fetch_seq(contig, 0, seq_len as usize)
+            .expect("Failed to fetch seq")
+            .iter()
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+
+        let chunk = GenomeChunk::new(contig.to_string(), u64::from(pos), u64::from(pos + 1));
+        let variants = call_variants(
+            &chunk,
+            test_bam,
+            &ref_seq,
+            20,
+            1,
+            1,
+            5,
+            20,
+            10,
+            1,
+            0.005,
+            &ReadNumber::R1,
+            3,
+            "model.onnx",
+            0.0,
+        )
+        .expect("call_variants failed");
+
+        let matching = variants
+            .iter()
+            .find(|v| v.pos == pos)
+            .expect("Expected variant not found");
+
+        let config = model_inference_config("model.onnx");
+        let session = load_onnx_session(&config.model_path).expect("Expected ONNX session to load");
+        let feature_order_err = resolve_feature_order(&session, config)
+            .expect_err("Expected current model metadata to be incompatible with generated features");
+
+        println!(
+            "wrapper probability for {}:{} {}>{} = {:.12}; feature-order resolution error = {}",
+            matching.contig,
+            matching.pos,
+            matching.reference,
+            matching.alt,
+            matching.model_probability,
+            feature_order_err,
+        );
+
+        assert!(matching.model_probability.is_finite());
+        assert!((0.0..=1.0).contains(&matching.model_probability));
+        assert_eq!(matching.model_probability, 1.0);
+        assert!(
+            feature_order_err.contains("unsupported") && feature_order_err.contains("incompatible"),
+            "expected feature schema incompatibility, got: {feature_order_err}"
         );
     }
 
@@ -2356,6 +2442,175 @@ mod tests {
     make_variant_test!(test_ref_ob_chr11_134610622_c_t_homo,            "ref_ob_chr11_134610622_C_T_homo.bam",            134610622, "C", "T",      ReadNumber::R1);
     make_variant_test!(test_ref_ot_chr11_134473154_g_a_homo,            "ref_ot_chr11_134473154_G_A_homo.bam",            134473154, "G", "A",      ReadNumber::R1);
     make_variant_test!(test_ref_ot_chr11_8195526_g_a_het,               "ref_ot_chr11_8195526_G_A_het.bam",               8195526,   "G", "A",      ReadNumber::R1);
+
+    #[test]
+    fn fisher_exact_strand_bias_is_more_significant_for_extreme_skew() {
+        let balanced = fisher_exact_test(2, 2, 2, 2);
+        let skewed = fisher_exact_test(4, 0, 0, 4);
+
+        assert!(balanced > 0.0 && balanced <= 1.0);
+        assert!(skewed < balanced, "Expected a stronger skew to drive a smaller p-value");
+        assert_eq!(fisher_exact_test(0, 0, 0, 0), 1.0);
+    }
+
+    #[test]
+    fn emitted_variant_carries_computed_strand_bias() {
+        let test_ref = "test_assets/chr11.fasta";
+        let test_bam = "test_assets/testing_bams/denovo_ot_chr11_134479860_A_G_homo.bam";
+
+        let ref_reader = faidx::Reader::from_path(test_ref).expect("Failed to open FASTA");
+        let contig = "chr11";
+        let pos = 134479860_u32;
+        let seq_len = ref_reader.fetch_seq_len(contig);
+        let ref_seq: Vec<u8> = ref_reader
+            .fetch_seq(contig, 0, seq_len as usize)
+            .expect("Failed to fetch seq")
+            .iter()
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+
+        let chunk = GenomeChunk::new(contig.to_string(), u64::from(pos), u64::from(pos + 1));
+        let variants = call_variants(
+            &chunk,
+            test_bam,
+            &ref_seq,
+            20,
+            1,
+            1,
+            5,
+            20,
+            10,
+            1,
+            0.005,
+            &ReadNumber::R1,
+            3,
+            "model.onnx",
+            0.1,
+        )
+        .expect("call_variants failed");
+
+        let matching = variants
+            .iter()
+            .find(|v| v.pos == pos)
+            .expect("Expected variant not found");
+
+        assert_eq!(matching.strand_bias, strand_bias_fisher_pvalue(matching));
+        assert!(matching.strand_bias > 0.0 && matching.strand_bias < 1.0);
+    }
+
+    #[test]
+    fn vcf_tnc_uses_alt_base_for_snps_only() {
+        let base_variant = Variant {
+            contig: "chr1".to_string(),
+            pos: 1,
+            reference: "T".to_string(),
+            alt: "C".to_string(),
+            genotype: "0/1".to_string(),
+            score: 42.0,
+            depth: 10,
+            alt_counts: 4,
+            calling_directive: CallingDirective::BothStrands,
+            error_rate: 0.001,
+            tnc: TrinucleotideContext::new(b'A', b'T', b'G'),
+            probability: 0.9,
+            average_ref_mapq: 30.0,
+            average_alt_mapq: 31.0,
+            average_ref_bq: 32.0,
+            average_alt_bq: 33.0,
+            avg_ref_dist_from_read_end: 5.0,
+            avg_alt_dist_from_read_end: 6.0,
+            avg_ref_insert_size: 200.0,
+            avg_alt_insert_size: 201.0,
+            fwd_probability: 0.8,
+            rev_probability: 0.7,
+            large_local_entropy: 1.1,
+            small_local_entropy: 0.9,
+            avg_mismatch_per_read: 0.2,
+            avg_read_length: 150.0,
+            alt_forward_count: 2,
+            alt_reverse_count: 2,
+            ref_forward_count: 3,
+            ref_reverse_count: 3,
+            model_probability: 0.95,
+            strand_bias: 0.5,
+        };
+
+        let snp_vcf = base_variant.to_vcf();
+        assert!(snp_vcf.contains(":A(T>C)G:"), "expected SNP TNC to show ref and ALT: {snp_vcf}");
+
+        let indel_variant = Variant {
+            reference: "T".to_string(),
+            alt: "TA".to_string(),
+            ..base_variant
+        };
+        let indel_vcf = indel_variant.to_vcf();
+        assert!(indel_vcf.contains(":ATG:"), "expected indel TNC to keep REF anchor: {indel_vcf}");
+    }
+
+    #[test]
+    fn vcf_format_columns_match_values_and_use_alt_strand_counts() {
+        let variant = Variant {
+            contig: "chr1".to_string(),
+            pos: 1,
+            reference: "T".to_string(),
+            alt: "C".to_string(),
+            genotype: "0/1".to_string(),
+            score: 42.0,
+            depth: 10,
+            alt_counts: 4,
+            calling_directive: CallingDirective::BothStrands,
+            error_rate: 0.001,
+            tnc: TrinucleotideContext::new(b'A', b'T', b'G'),
+            probability: 0.9,
+            average_ref_mapq: 30.0,
+            average_alt_mapq: 31.0,
+            average_ref_bq: 32.0,
+            average_alt_bq: 33.0,
+            avg_ref_dist_from_read_end: 5.0,
+            avg_alt_dist_from_read_end: 6.0,
+            avg_ref_insert_size: 200.0,
+            avg_alt_insert_size: 201.0,
+            fwd_probability: 0.8,
+            rev_probability: 0.2,
+            large_local_entropy: 1.1,
+            small_local_entropy: 0.9,
+            avg_mismatch_per_read: 0.2,
+            avg_read_length: 150.0,
+            alt_forward_count: 2,
+            alt_reverse_count: 1,
+            ref_forward_count: 7,
+            ref_reverse_count: 5,
+            model_probability: 0.95,
+            strand_bias: 0.5,
+        };
+
+        let record = variant.to_vcf();
+        let fields: Vec<_> = record.trim_end().split('\t').collect();
+        let format_keys: Vec<_> = fields[8].split(':').collect();
+        let sample_values: Vec<_> = fields[9].split(':').collect();
+
+        assert_eq!(format_keys.len(), sample_values.len(), "FORMAT/value column count mismatch: {record}");
+        assert!(!format_keys.contains(&"MFC"), "dead FORMAT key should not be emitted: {record}");
+        assert_eq!(sample_values[20], "2", "FWD should be alt-supporting forward reads");
+        assert_eq!(sample_values[21], "1", "REV should be alt-supporting reverse reads");
+        assert_eq!(sample_values[22], "3", "TOT should be total alt-supporting reads");
+    }
+
+    #[test]
+    fn vcf_header_describes_emitted_format_fields() {
+        let bam = bam::Reader::from_path(
+            "test_assets/testing_bams/denovo_ot_chr11_134749303_A_G_het.bam",
+        )
+        .expect("Failed to open BAM");
+        let header = bam.header().to_owned();
+        let vcf_header = get_vcf_header(&header);
+
+        assert!(vcf_header.contains("##FORMAT=<ID=STB,Number=1,Type=Float"));
+        assert!(vcf_header.contains("Aggregate right-tail binomial evidence score"));
+        assert!(vcf_header.contains("Fraction of strand-separated aggregate evidence contributed by forward reads"));
+        assert!(vcf_header.contains("Total alternate-supporting read count across both strands"));
+        assert!(!vcf_header.contains("##FORMAT=<ID=MFC,"));
+    }
 
     fn load_ref_seq(contig: &str) -> Vec<u8> {
         let ref_reader =
